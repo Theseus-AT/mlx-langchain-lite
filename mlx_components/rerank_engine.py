@@ -1,632 +1,1300 @@
 """
-MLX Re-ranking Engine
-Optimiert Search Results zwischen Vector Retrieval und LLM Generation
-Verbessert Relevanz und Qualität der RAG Responses
+MLX Rerank Engine - LLM-basiertes Batch-Reranking
+Intelligente Neuordnung von Suchergebnissen mit MLX Parallels Integration
 """
 
 import asyncio
 import time
-import math
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Union, Tuple, Callable
-from dataclasses import dataclass, asdict
-from datetime import datetime
+import logging
+import re
+from typing import List, Dict, Any, Optional, Union, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
 import json
+import math
 
-import mlx.core as mx
-import mlx.nn as nn
-import numpy as np
-from collections import Counter
+# MLX Parallels Integration
+try:
+    from mlx_parallels.core.batch_processor import BatchProcessor, BatchResult
+    from mlx_parallels.core.config import get_fast_inference_config
+    BATCH_PROCESSING_AVAILABLE = True
+except ImportError:
+    BATCH_PROCESSING_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+
+class RerankMethod(Enum):
+    """Reranking-Methoden"""
+    SIMILARITY_SCORE = "similarity_score"
+    BM25 = "bm25"
+    TFIDF = "tfidf"
+    LLM_SCORING = "llm_scoring"
+    LLM_PAIRWISE = "llm_pairwise"
+    HYBRID = "hybrid"
+
 
 @dataclass
-class ReRankConfig:
-    """Konfiguration für Re-ranking Engine"""
-    rerank_model_path: Optional[str] = None  # Falls MLX Re-rank Modell verfügbar
-    max_candidates: int = 50
-    top_k: int = 5
+class RerankConfig:
+    """Konfiguration für Reranking Engine"""
+    
+    # Haupt-Reranking Methode
+    primary_method: RerankMethod = RerankMethod.HYBRID
+    fallback_method: RerankMethod = RerankMethod.SIMILARITY_SCORE
+    
+    # LLM-Reranking Settings
+    llm_model: str = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+    enable_batch_llm: bool = True
+    max_llm_batch_size: int = 16
+    llm_temperature: float = 0.1  # Niedrig für konsistente Scores
+    
+    # Scoring Settings
+    max_documents_for_llm: int = 20  # LLM nur für Top-K
     score_threshold: float = 0.1
-    diversity_factor: float = 0.3
-    freshness_weight: float = 0.1
-    length_penalty: float = 0.05
-    semantic_boost: float = 0.2
-    enable_diversity_rerank: bool = True
-    enable_semantic_clustering: bool = True
+    diversity_factor: float = 0.1  # Für Diversität in Ergebnissen
+    
+    # Performance Settings
+    enable_caching: bool = True
+    cache_size: int = 1000
+    timeout_seconds: float = 30.0
+    
+    # BM25/TF-IDF Settings
+    k1: float = 1.5  # BM25 parameter
+    b: float = 0.75  # BM25 parameter
+    min_doc_freq: int = 1
 
-@dataclass
-class RerankCandidate:
-    """Kandidat für Re-ranking"""
-    id: str
-    content: str
-    metadata: Dict[str, Any]
-    original_score: float
-    rerank_score: Optional[float] = None
-    final_score: Optional[float] = None
-    features: Optional[Dict[str, float]] = None
 
 @dataclass
 class RerankResult:
-    """Ergebnis des Re-ranking Prozesses"""
-    candidates: List[RerankCandidate]
-    total_candidates: int
+    """Reranking-Ergebnis"""
+    documents: List[str]
+    scores: List[float]
+    original_indices: List[int]
+    method_used: RerankMethod
     processing_time: float
-    algorithm_used: str
-    score_distribution: Dict[str, float]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class BatchRerankResult:
+    """Batch-Reranking-Ergebnis"""
+    results: List[RerankResult]
+    total_queries: int
+    processing_time: float
+    avg_docs_per_query: float
+    successful_queries: int
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
 
 class MLXRerankEngine:
     """
-    Intelligente Re-ranking Engine für RAG Optimization
+    Enhanced Rerank Engine mit LLM-basiertem Batch-Reranking
     
     Features:
-    - Multiple Re-ranking Algorithms
-    - Semantic Diversity Optimization
-    - Query-Document Relevance Scoring
-    - Freshness and Length Balancing
-    - Content Clustering für Diversity
-    - Performance Monitoring
-    - Hybrid Scoring Models
+    - Multiple Reranking-Algorithmen (BM25, TF-IDF, LLM-Scoring)
+    - Batch-LLM-Reranking für bessere Performance
+    - Hybrid-Ansatz kombiniert verschiedene Methoden
+    - Intelligent Caching für wiederholte Queries
+    - Diversitäts-Optimierung
     """
     
-    def __init__(self, config: ReRankConfig = None):
-        self.config = config or ReRankConfig()
-        self.rerank_model = None
-        self.tokenizer = None
+    def __init__(self, config: RerankConfig):
+        self.config = config
+        self.llm_handler = None
+        self.cache = {} if config.enable_caching else None
         
-        # Performance Metrics
-        self.total_reranks = 0
-        self.total_processing_time = 0.0
-        self.algorithm_usage = Counter()
-        
-        # Feature extractors
-        self.feature_extractors = {
-            "query_overlap": self._extract_query_overlap,
-            "content_length": self._extract_content_length,
-            "freshness": self._extract_freshness,
-            "semantic_density": self._extract_semantic_density,
-            "metadata_relevance": self._extract_metadata_relevance
+        # Performance Tracking
+        self.stats = {
+            'total_reranks': 0,
+            'batch_reranks': 0,
+            'llm_reranks': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'avg_processing_time': 0.0,
+            'method_usage': {method.value: 0 for method in RerankMethod}
         }
         
-        # Available algorithms
-        self.algorithms = {
-            "hybrid_scoring": self._hybrid_scoring_rerank,
-            "semantic_diversity": self._semantic_diversity_rerank,
-            "query_focused": self._query_focused_rerank,
-            "balanced": self._balanced_rerank
-        }
+        # Pre-computed word frequencies für BM25/TF-IDF
+        self._doc_frequencies = {}
+        self._avg_doc_length = 0
+        
+        logger.info(f"RerankEngine initialisiert - Primäre Methode: {config.primary_method.value}")
     
-    async def initialize(self) -> None:
-        """
-        Initialisiert Re-rank Modell falls verfügbar
-        """
-        if self.config.rerank_model_path and self.rerank_model is None:
-            try:
-                print(f"Loading rerank model: {self.config.rerank_model_path}")
-                # Placeholder für zukünftige MLX Re-rank Modelle
-                # self.rerank_model, self.tokenizer = load(self.config.rerank_model_path)
-                print("✅ Rerank model loaded (placeholder)")
-            except Exception as e:
-                print(f"⚠️ Rerank model not available, using algorithmic ranking: {e}")
+    async def initialize(self, llm_handler=None):
+        """Initialisiert Rerank Engine"""
+        try:
+            # LLM Handler für LLM-basiertes Reranking
+            if llm_handler:
+                self.llm_handler = llm_handler
+                logger.info("✅ Externe LLM Handler verbunden")
+            elif self.config.enable_batch_llm and BATCH_PROCESSING_AVAILABLE:
+                # Eigener LLM Handler für Reranking
+                mlx_config = get_fast_inference_config(self.config.llm_model)
+                mlx_config.generation.temperature = self.config.llm_temperature
+                mlx_config.generation.max_tokens = 50  # Kurze Scores
+                mlx_config.batch.max_batch_size = self.config.max_llm_batch_size
+                
+                self.batch_processor = BatchProcessor(mlx_config)
+                success = self.batch_processor.load_model()
+                
+                if success:
+                    logger.info("✅ Integrierte LLM Handler für Reranking initialisiert")
+                else:
+                    logger.warning("⚠️  LLM Handler fehlgeschlagen - verwende Fallback-Methoden")
+                    self.batch_processor = None
+            else:
+                logger.info("📝 Reranking ohne LLM-Unterstützung")
+                self.batch_processor = None
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Rerank Engine Initialisierung fehlgeschlagen: {e}")
+            return False
     
-    async def rerank(self, 
-                    query: str,
-                    candidates: List[Dict[str, Any]],
-                    top_k: Optional[int] = None,
-                    algorithm: str = "balanced") -> RerankResult:
+    # Haupt-Reranking Methoden
+    
+    async def rerank(
+        self,
+        query: str,
+        documents: List[str],
+        scores: Optional[List[float]] = None,
+        method: Optional[RerankMethod] = None
+    ) -> List[str]:
         """
-        Hauptfunktion: Re-rankt Kandidaten basierend auf Query
+        Einzelnes Reranking - Legacy-kompatibel
         """
+        result = await self.rerank_with_scores(query, documents, scores, method)
+        return result.documents
+    
+    async def rerank_with_scores(
+        self,
+        query: str,
+        documents: List[str],
+        scores: Optional[List[float]] = None,
+        method: Optional[RerankMethod] = None
+    ) -> RerankResult:
+        """
+        Reranking mit detaillierten Scores
+        """
+        if not documents:
+            return RerankResult(
+                documents=[],
+                scores=[],
+                original_indices=[],
+                method_used=method or self.config.primary_method,
+                processing_time=0.0
+            )
+        
+        method = method or self.config.primary_method
         start_time = time.time()
         
-        await self.initialize()
-        
-        top_k = top_k or self.config.top_k
-        
-        # Convert to RerankCandidate objects
-        rerank_candidates = []
-        for i, candidate in enumerate(candidates):
-            rerank_candidate = RerankCandidate(
-                id=candidate.get("id", f"candidate_{i}"),
-                content=candidate.get("content", candidate.get("text", "")),
-                metadata=candidate.get("metadata", {}),
-                original_score=candidate.get("score", 0.0)
-            )
-            rerank_candidates.append(rerank_candidate)
-        
-        # Limit candidates if too many
-        if len(rerank_candidates) > self.config.max_candidates:
-            # Keep top candidates by original score
-            rerank_candidates.sort(key=lambda x: x.original_score, reverse=True)
-            rerank_candidates = rerank_candidates[:self.config.max_candidates]
-        
-        # Extract features for all candidates
-        for candidate in rerank_candidates:
-            candidate.features = await self._extract_features(query, candidate)
-        
-        # Apply selected algorithm
-        if algorithm in self.algorithms:
-            ranked_candidates = await self.algorithms[algorithm](query, rerank_candidates)
-        else:
-            print(f"Unknown algorithm {algorithm}, using balanced")
-            ranked_candidates = await self._balanced_rerank(query, rerank_candidates)
-        
-        # Filter by score threshold and limit
-        filtered_candidates = [
-            c for c in ranked_candidates 
-            if c.final_score >= self.config.score_threshold
-        ][:top_k]
-        
-        processing_time = time.time() - start_time
-        
-        # Update metrics
-        self.total_reranks += 1
-        self.total_processing_time += processing_time
-        self.algorithm_usage[algorithm] += 1
-        
-        # Calculate score distribution
-        scores = [c.final_score for c in filtered_candidates if c.final_score is not None]
-        score_distribution = {
-            "mean": np.mean(scores) if scores else 0.0,
-            "std": np.std(scores) if scores else 0.0,
-            "min": min(scores) if scores else 0.0,
-            "max": max(scores) if scores else 0.0
-        }
-        
-        return RerankResult(
-            candidates=filtered_candidates,
-            total_candidates=len(candidates),
-            processing_time=processing_time,
-            algorithm_used=algorithm,
-            score_distribution=score_distribution
-        )
-    
-    async def _hybrid_scoring_rerank(self, 
-                                   query: str, 
-                                   candidates: List[RerankCandidate]) -> List[RerankCandidate]:
-        """
-        Hybrid Scoring kombiniert multiple Faktoren
-        """
-        for candidate in candidates:
-            features = candidate.features
-            
-            # Weighted combination of features
-            hybrid_score = (
-                features["query_overlap"] * 0.4 +
-                features["semantic_density"] * 0.25 +
-                candidate.original_score * 0.2 +
-                features["freshness"] * self.config.freshness_weight +
-                features["metadata_relevance"] * 0.1 -
-                features["length_penalty"] * self.config.length_penalty
-            )
-            
-            candidate.rerank_score = hybrid_score
-            candidate.final_score = hybrid_score
-        
-        # Sort by final score
-        candidates.sort(key=lambda x: x.final_score, reverse=True)
-        return candidates
-    
-    async def _semantic_diversity_rerank(self, 
-                                       query: str, 
-                                       candidates: List[RerankCandidate]) -> List[RerankCandidate]:
-        """
-        Semantic Diversity Reranking für vielfältige Results
-        """
-        if not self.config.enable_diversity_rerank:
-            return await self._hybrid_scoring_rerank(query, candidates)
-        
-        # First pass: Score by relevance
-        relevance_scored = await self._hybrid_scoring_rerank(query, candidates)
-        
-        # Second pass: Apply diversity penalty
-        final_candidates = []
-        selected_content = []
-        
-        for candidate in relevance_scored:
-            # Calculate diversity penalty
-            diversity_penalty = 0.0
-            
-            for selected in selected_content:
-                similarity = self._calculate_content_similarity(
-                    candidate.content, 
-                    selected
-                )
-                diversity_penalty += similarity * self.config.diversity_factor
-            
-            # Apply diversity penalty
-            diversity_score = candidate.rerank_score - diversity_penalty
-            candidate.final_score = diversity_score
-            
-            final_candidates.append(candidate)
-            selected_content.append(candidate.content)
-        
-        # Sort by diversity-adjusted score
-        final_candidates.sort(key=lambda x: x.final_score, reverse=True)
-        return final_candidates
-    
-    async def _query_focused_rerank(self, 
-                                  query: str, 
-                                  candidates: List[RerankCandidate]) -> List[RerankCandidate]:
-        """
-        Query-focused Reranking priorisiert Query-Ähnlichkeit
-        """
-        for candidate in candidates:
-            features = candidate.features
-            
-            # Strong focus on query relevance
-            query_score = (
-                features["query_overlap"] * 0.6 +
-                features["semantic_density"] * 0.3 +
-                candidate.original_score * 0.1
-            )
-            
-            candidate.rerank_score = query_score
-            candidate.final_score = query_score
-        
-        candidates.sort(key=lambda x: x.final_score, reverse=True)
-        return candidates
-    
-    async def _balanced_rerank(self, 
-                             query: str, 
-                             candidates: List[RerankCandidate]) -> List[RerankCandidate]:
-        """
-        Balanced Reranking kombiniert Relevanz und Diversity
-        """
-        # Apply hybrid scoring first
-        hybrid_candidates = await self._hybrid_scoring_rerank(query, candidates)
-        
-        # Then apply light diversity adjustment
-        if self.config.enable_diversity_rerank:
-            # Use lower diversity factor for balanced approach
-            original_diversity_factor = self.config.diversity_factor
-            self.config.diversity_factor *= 0.5  # Reduce diversity impact
-            
-            diversity_candidates = await self._semantic_diversity_rerank(query, hybrid_candidates)
-            
-            # Restore original setting
-            self.config.diversity_factor = original_diversity_factor
-            
-            return diversity_candidates
-        
-        return hybrid_candidates
-    
-    async def _extract_features(self, 
-                              query: str, 
-                              candidate: RerankCandidate) -> Dict[str, float]:
-        """
-        Extrahiert Features für Scoring
-        """
-        features = {}
-        
-        for feature_name, extractor in self.feature_extractors.items():
-            try:
-                features[feature_name] = await extractor(query, candidate)
-            except Exception as e:
-                print(f"Error extracting feature {feature_name}: {e}")
-                features[feature_name] = 0.0
-        
-        return features
-    
-    async def _extract_query_overlap(self, 
-                                   query: str, 
-                                   candidate: RerankCandidate) -> float:
-        """
-        Berechnet Query-Content Overlap
-        """
-        query_words = set(query.lower().split())
-        content_words = set(candidate.content.lower().split())
-        
-        if not query_words:
-            return 0.0
-        
-        overlap = len(query_words.intersection(content_words))
-        return overlap / len(query_words)
-    
-    async def _extract_content_length(self, 
-                                    query: str, 
-                                    candidate: RerankCandidate) -> float:
-        """
-        Normalisiert Content Length (längere Texte haben penalties)
-        """
-        content_length = len(candidate.content)
-        
-        # Optimal length around 500-1000 characters
-        optimal_length = 750
-        
-        if content_length <= optimal_length:
-            return 1.0
-        else:
-            # Penalty for overly long content
-            penalty = min(1.0, (content_length - optimal_length) / optimal_length)
-            return max(0.0, 1.0 - penalty)
-    
-    async def _extract_freshness(self, 
-                               query: str, 
-                               candidate: RerankCandidate) -> float:
-        """
-        Bewertet Content Freshness basierend auf Timestamps
-        """
-        timestamp_str = candidate.metadata.get("timestamp")
-        if not timestamp_str:
-            return 0.5  # Neutral score for unknown timestamps
+        # Cache-Check
+        cache_key = None
+        if self.cache is not None:
+            cache_key = self._generate_cache_key(query, documents, method)
+            if cache_key in self.cache:
+                self.stats['cache_hits'] += 1
+                cached_result = self.cache[cache_key]
+                cached_result.metadata['from_cache'] = True
+                return cached_result
+            self.stats['cache_misses'] += 1
         
         try:
-            content_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-            current_time = datetime.now()
+            # Reranking durchführen
+            result = await self._execute_reranking(query, documents, scores, method)
             
-            # Calculate age in days
-            age_days = (current_time - content_time).days
+            # Cache speichern
+            if self.cache is not None and cache_key:
+                if len(self.cache) < self.config.cache_size:
+                    self.cache[cache_key] = result
+                elif len(self.cache) >= self.config.cache_size:
+                    # LRU: Entferne ältesten Eintrag
+                    oldest_key = next(iter(self.cache))
+                    del self.cache[oldest_key]
+                    self.cache[cache_key] = result
             
-            # Fresher content gets higher scores
-            if age_days <= 1:
-                return 1.0
-            elif age_days <= 7:
-                return 0.8
-            elif age_days <= 30:
-                return 0.6
-            elif age_days <= 90:
-                return 0.4
+            # Stats aktualisieren
+            processing_time = time.time() - start_time
+            result.processing_time = processing_time
+            self._update_stats(1, processing_time, method)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Reranking fehlgeschlagen: {e}")
+            # Fallback: Original-Reihenfolge
+            return RerankResult(
+                documents=documents,
+                scores=scores or [1.0] * len(documents),
+                original_indices=list(range(len(documents))),
+                method_used=RerankMethod.SIMILARITY_SCORE,
+                processing_time=time.time() - start_time,
+                metadata={'error': str(e)}
+            )
+    
+    async def batch_rerank(
+        self,
+        queries: List[str],
+        document_lists: List[List[str]],
+        score_lists: Optional[List[List[float]]] = None,
+        method: Optional[RerankMethod] = None
+    ) -> BatchRerankResult:
+        """
+        Batch-Reranking für optimale Performance
+        """
+        if len(queries) != len(document_lists):
+            raise ValueError("Anzahl Queries muss Anzahl Document-Listen entsprechen")
+        
+        method = method or self.config.primary_method
+        start_time = time.time()
+        
+        try:
+            # Batch-LLM-Reranking falls möglich
+            if method in [RerankMethod.LLM_SCORING, RerankMethod.LLM_PAIRWISE, RerankMethod.HYBRID]:
+                if self._can_use_batch_llm():
+                    results = await self._batch_llm_rerank(
+                        queries, document_lists, score_lists, method
+                    )
+                else:
+                    # Fallback: Sequentiell
+                    results = await self._sequential_rerank(
+                        queries, document_lists, score_lists, method
+                    )
             else:
-                return 0.2
-                
-        except Exception:
-            return 0.5
-    
-    async def _extract_semantic_density(self, 
-                                      query: str, 
-                                      candidate: RerankCandidate) -> float:
-        """
-        Schätzt semantische Dichte des Contents
-        """
-        content = candidate.content
-        
-        # Simple heuristics for semantic density
-        sentences = content.split('.')
-        avg_sentence_length = np.mean([len(s.split()) for s in sentences if s.strip()])
-        
-        # Optimal sentence length around 10-20 words
-        if 8 <= avg_sentence_length <= 25:
-            sentence_score = 1.0
-        else:
-            sentence_score = max(0.3, 1.0 - abs(avg_sentence_length - 15) / 20)
-        
-        # Check for technical terms or specific vocabulary
-        technical_terms = len([w for w in content.split() if len(w) > 6])
-        technical_ratio = technical_terms / len(content.split()) if content.split() else 0
-        
-        # Balance between technical depth and readability
-        technical_score = min(1.0, technical_ratio * 3)
-        
-        return (sentence_score + technical_score) / 2
-    
-    async def _extract_metadata_relevance(self, 
-                                        query: str, 
-                                        candidate: RerankCandidate) -> float:
-        """
-        Bewertet Metadata-Relevanz zur Query
-        """
-        metadata = candidate.metadata
-        query_lower = query.lower()
-        
-        relevance_score = 0.0
-        
-        # Check title relevance
-        title = metadata.get("title", "").lower()
-        if title and any(word in title for word in query_lower.split()):
-            relevance_score += 0.4
-        
-        # Check category/topic relevance
-        category = metadata.get("category", "").lower()
-        if category and any(word in category for word in query_lower.split()):
-            relevance_score += 0.3
-        
-        # Check tags relevance
-        tags = metadata.get("tags", [])
-        if tags:
-            tag_matches = sum(1 for tag in tags if any(word in tag.lower() for word in query_lower.split()))
-            relevance_score += min(0.3, tag_matches * 0.1)
-        
-        return min(1.0, relevance_score)
-    
-    def _calculate_content_similarity(self, content1: str, content2: str) -> float:
-        """
-        Berechnet Ähnlichkeit zwischen zwei Texten
-        """
-        words1 = set(content1.lower().split())
-        words2 = set(content2.lower().split())
-        
-        if not words1 or not words2:
-            return 0.0
-        
-        intersection = len(words1.intersection(words2))
-        union = len(words1.union(words2))
-        
-        return intersection / union if union > 0 else 0.0
-    
-    async def rerank_with_llm_scoring(self, 
-                                    query: str,
-                                    candidates: List[Dict[str, Any]],
-                                    llm_handler,
-                                    top_k: Optional[int] = None) -> RerankResult:
-        """
-        Advanced Re-ranking mit LLM-basiertem Scoring
-        """
-        top_k = top_k or self.config.top_k
-        
-        # First pass: Standard reranking
-        initial_rerank = await self.rerank(query, candidates, top_k * 2, "balanced")
-        
-        # Second pass: LLM scoring for top candidates
-        llm_scored_candidates = []
-        
-        for candidate in initial_rerank.candidates[:top_k * 2]:
-            # Create LLM prompt for relevance scoring
-            scoring_prompt = f"""
-            Rate the relevance of the following document to the query on a scale of 0.0 to 1.0.
-            
-            Query: {query}
-            
-            Document: {candidate.content[:500]}...
-            
-            Consider: semantic relevance, factual accuracy, and completeness.
-            Respond with only a number between 0.0 and 1.0.
-            """
-            
-            try:
-                from mlx_components.llm_handler import LLMRequest
-                
-                llm_request = LLMRequest(
-                    prompt=scoring_prompt,
-                    user_id="rerank_system",
-                    max_tokens=10,
-                    temperature=0.0
+                # Non-LLM Methoden parallel verarbeiten
+                results = await self._parallel_non_llm_rerank(
+                    queries, document_lists, score_lists, method
                 )
-                
-                llm_response = await llm_handler.generate_single(llm_request)
-                
-                # Parse LLM score
-                llm_score_str = llm_response.response.strip()
-                try:
-                    llm_score = float(llm_score_str)
-                    llm_score = max(0.0, min(1.0, llm_score))  # Clamp to [0,1]
-                except ValueError:
-                    llm_score = candidate.final_score  # Fallback to original score
-                
-                # Combine original score with LLM score
-                combined_score = (candidate.final_score * 0.6) + (llm_score * 0.4)
-                candidate.final_score = combined_score
-                candidate.metadata["llm_score"] = llm_score
-                
-                llm_scored_candidates.append(candidate)
-                
-            except Exception as e:
-                print(f"Error in LLM scoring: {e}")
-                llm_scored_candidates.append(candidate)
-        
-        # Sort by combined score
-        llm_scored_candidates.sort(key=lambda x: x.final_score, reverse=True)
-        
-        return RerankResult(
-            candidates=llm_scored_candidates[:top_k],
-            total_candidates=len(candidates),
-            processing_time=initial_rerank.processing_time,
-            algorithm_used="llm_enhanced",
-            score_distribution=initial_rerank.score_distribution
-        )
-    
-    def get_performance_stats(self) -> Dict[str, Any]:
-        """
-        Liefert Performance-Statistiken
-        """
-        avg_processing_time = self.total_processing_time / self.total_reranks if self.total_reranks > 0 else 0
-        
-        return {
-            "total_reranks": self.total_reranks,
-            "total_processing_time": self.total_processing_time,
-            "average_processing_time": avg_processing_time,
-            "reranks_per_second": self.total_reranks / self.total_processing_time if self.total_processing_time > 0 else 0,
-            "algorithm_usage": dict(self.algorithm_usage),
-            "available_algorithms": list(self.algorithms.keys()),
-            "feature_extractors": list(self.feature_extractors.keys())
-        }
-    
-    async def benchmark(self, sample_query: str = "machine learning applications") -> Dict[str, float]:
-        """
-        Performance Benchmark für Re-ranking Engine
-        """
-        print("Running Re-ranking Engine Benchmark...")
-        
-        # Create test candidates
-        test_candidates = []
-        for i in range(20):
-            candidate = {
-                "id": f"doc_{i}",
-                "content": f"This is test document {i} about machine learning and artificial intelligence. " * 10,
-                "metadata": {
-                    "title": f"Document {i}",
-                    "timestamp": datetime.now().isoformat(),
-                    "category": "technology" if i % 2 == 0 else "research"
-                },
-                "score": 0.8 - (i * 0.02)  # Decreasing scores
-            }
-            test_candidates.append(candidate)
-        
-        # Benchmark different algorithms
-        results = {}
-        
-        for algorithm in self.algorithms.keys():
-            start_time = time.time()
             
-            rerank_result = await self.rerank(
-                query=sample_query,
-                candidates=test_candidates,
-                top_k=10,
-                algorithm=algorithm
+            processing_time = time.time() - start_time
+            successful_queries = len([r for r in results if 'error' not in r.metadata])
+            
+            # Stats aktualisieren
+            self.stats['batch_reranks'] += 1
+            self._update_stats(len(queries), processing_time, method)
+            
+            # Durchschnittliche Dokumente pro Query
+            total_docs = sum(len(docs) for docs in document_lists)
+            avg_docs = total_docs / len(document_lists) if document_lists else 0
+            
+            logger.info(f"Batch-Reranking abgeschlossen: {len(queries)} Queries, "
+                       f"{successful_queries} erfolgreich, {processing_time:.2f}s")
+            
+            return BatchRerankResult(
+                results=results,
+                total_queries=len(queries),
+                processing_time=processing_time,
+                avg_docs_per_query=avg_docs,
+                successful_queries=successful_queries,
+                metadata={
+                    'method': method.value,
+                    'batch_llm_used': method in [RerankMethod.LLM_SCORING, RerankMethod.LLM_PAIRWISE] and self._can_use_batch_llm()
+                }
             )
             
-            algorithm_time = time.time() - start_time
-            results[f"{algorithm}_time"] = algorithm_time
-            results[f"{algorithm}_candidates"] = len(rerank_result.candidates)
+        except Exception as e:
+            logger.error(f"Batch-Reranking fehlgeschlagen: {e}")
+            # Fallback: Leere Ergebnisse
+            empty_results = []
+            for i, (query, docs) in enumerate(zip(queries, document_lists)):
+                empty_results.append(RerankResult(
+                    documents=docs,
+                    scores=[1.0] * len(docs),
+                    original_indices=list(range(len(docs))),
+                    method_used=RerankMethod.SIMILARITY_SCORE,
+                    processing_time=0.0,
+                    metadata={'error': str(e)}
+                ))
+            
+            return BatchRerankResult(
+                results=empty_results,
+                total_queries=len(queries),
+                processing_time=time.time() - start_time,
+                avg_docs_per_query=0,
+                successful_queries=0,
+                metadata={'error': str(e)}
+            )
+    
+    # Spezifische Reranking-Algorithmen
+    
+    async def _execute_reranking(
+        self,
+        query: str,
+        documents: List[str],
+        scores: Optional[List[float]],
+        method: RerankMethod
+    ) -> RerankResult:
+        """Führt spezifische Reranking-Methode aus"""
+        
+        original_indices = list(range(len(documents)))
+        
+        if method == RerankMethod.SIMILARITY_SCORE:
+            return await self._similarity_rerank(query, documents, scores)
+        elif method == RerankMethod.BM25:
+            return await self._bm25_rerank(query, documents, scores)
+        elif method == RerankMethod.TFIDF:
+            return await self._tfidf_rerank(query, documents, scores)
+        elif method == RerankMethod.LLM_SCORING:
+            return await self._llm_scoring_rerank(query, documents, scores)
+        elif method == RerankMethod.LLM_PAIRWISE:
+            return await self._llm_pairwise_rerank(query, documents, scores)
+        elif method == RerankMethod.HYBRID:
+            return await self._hybrid_rerank(query, documents, scores)
+        else:
+            # Fallback: Similarity-basiert
+            return await self._similarity_rerank(query, documents, scores)
+    
+    async def _similarity_rerank(
+        self,
+        query: str,
+        documents: List[str],
+        scores: Optional[List[float]]
+    ) -> RerankResult:
+        """Einfaches Score-basiertes Reranking"""
+        
+        if scores is None:
+            scores = [1.0] * len(documents)
+        
+        # Sortiere nach Scores (absteigend)
+        sorted_items = sorted(
+            zip(documents, scores, range(len(documents))),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        
+        reranked_docs, reranked_scores, original_indices = zip(*sorted_items)
+        
+        return RerankResult(
+            documents=list(reranked_docs),
+            scores=list(reranked_scores),
+            original_indices=list(original_indices),
+            method_used=RerankMethod.SIMILARITY_SCORE,
+            processing_time=0.0
+        )
+    
+    async def _bm25_rerank(
+        self,
+        query: str,
+        documents: List[str],
+        scores: Optional[List[float]]
+    ) -> RerankResult:
+        """BM25-basiertes Reranking"""
+        
+        try:
+            # Query-Terms extrahieren
+            query_terms = self._tokenize(query.lower())
+            
+            # BM25-Scores berechnen
+            bm25_scores = []
+            doc_lengths = [len(self._tokenize(doc)) for doc in documents]
+            avg_doc_length = sum(doc_lengths) / len(doc_lengths) if doc_lengths else 1
+            
+            for i, document in enumerate(documents):
+                doc_terms = self._tokenize(document.lower())
+                doc_length = doc_lengths[i]
+                
+                score = 0.0
+                for term in query_terms:
+                    # Term frequency in document
+                    tf = doc_terms.count(term)
+                    if tf == 0:
+                        continue
+                    
+                    # Document frequency (vereinfacht)
+                    df = sum(1 for doc in documents if term in self._tokenize(doc.lower()))
+                    idf = math.log((len(documents) - df + 0.5) / (df + 0.5))
+                    
+                    # BM25 Score
+                    numerator = tf * (self.config.k1 + 1)
+                    denominator = tf + self.config.k1 * (1 - self.config.b + self.config.b * (doc_length / avg_doc_length))
+                    
+                    score += idf * (numerator / denominator)
+                
+                bm25_scores.append(score)
+            
+            # Kombiniere mit Original-Scores falls vorhanden
+            if scores:
+                # Normalisiere beide Score-Sets
+                max_bm25 = max(bm25_scores) if bm25_scores else 1
+                max_orig = max(scores) if scores else 1
+                
+                combined_scores = [
+                    0.7 * (bm25 / max_bm25) + 0.3 * (orig / max_orig)
+                    for bm25, orig in zip(bm25_scores, scores)
+                ]
+            else:
+                combined_scores = bm25_scores
+            
+            # Sortieren
+            sorted_items = sorted(
+                zip(documents, combined_scores, range(len(documents))),
+                key=lambda x: x[1],
+                reverse=True
+            )
+            
+            reranked_docs, reranked_scores, original_indices = zip(*sorted_items)
+            
+            return RerankResult(
+                documents=list(reranked_docs),
+                scores=list(reranked_scores),
+                original_indices=list(original_indices),
+                method_used=RerankMethod.BM25,
+                processing_time=0.0,
+                metadata={'avg_doc_length': avg_doc_length, 'query_terms': len(query_terms)}
+            )
+            
+        except Exception as e:
+            logger.warning(f"BM25 Reranking fehlgeschlagen: {e}")
+            return await self._similarity_rerank(query, documents, scores)
+    
+    async def _tfidf_rerank(
+        self,
+        query: str,
+        documents: List[str],
+        scores: Optional[List[float]]
+    ) -> RerankResult:
+        """TF-IDF-basiertes Reranking"""
+        
+        try:
+            # Query-Terms
+            query_terms = self._tokenize(query.lower())
+            
+            # TF-IDF Scores berechnen
+            tfidf_scores = []
+            
+            for document in documents:
+                doc_terms = self._tokenize(document.lower())
+                doc_length = len(doc_terms)
+                
+                score = 0.0
+                for term in query_terms:
+                    # Term frequency
+                    tf = doc_terms.count(term) / doc_length if doc_length > 0 else 0
+                    
+                    # Inverse document frequency
+                    df = sum(1 for doc in documents if term in self._tokenize(doc.lower()))
+                    idf = math.log(len(documents) / (df + 1))
+                    
+                    score += tf * idf
+                
+                tfidf_scores.append(score)
+            
+            # Kombiniere mit Original-Scores
+            if scores:
+                max_tfidf = max(tfidf_scores) if tfidf_scores else 1
+                max_orig = max(scores) if scores else 1
+                
+                combined_scores = [
+                    0.6 * (tfidf / max_tfidf) + 0.4 * (orig / max_orig)
+                    for tfidf, orig in zip(tfidf_scores, scores)
+                ]
+            else:
+                combined_scores = tfidf_scores
+            
+            # Sortieren
+            sorted_items = sorted(
+                zip(documents, combined_scores, range(len(documents))),
+                key=lambda x: x[1],
+                reverse=True
+            )
+            
+            reranked_docs, reranked_scores, original_indices = zip(*sorted_items)
+            
+            return RerankResult(
+                documents=list(reranked_docs),
+                scores=list(reranked_scores),
+                original_indices=list(original_indices),
+                method_used=RerankMethod.TFIDF,
+                processing_time=0.0,
+                metadata={'query_terms': len(query_terms)}
+            )
+            
+        except Exception as e:
+            logger.warning(f"TF-IDF Reranking fehlgeschlagen: {e}")
+            return await self._similarity_rerank(query, documents, scores)
+    
+    async def _llm_scoring_rerank(
+        self,
+        query: str,
+        documents: List[str],
+        scores: Optional[List[float]]
+    ) -> RerankResult:
+        """LLM-basiertes Scoring Reranking"""
+        
+        if not self._can_use_llm():
+            logger.warning("LLM nicht verfügbar - fallback zu BM25")
+            return await self._bm25_rerank(query, documents, scores)
+        
+        try:
+            # Limitiere auf Top-K Dokumente für LLM
+            top_docs = documents[:self.config.max_documents_for_llm]
+            top_scores = scores[:self.config.max_documents_for_llm] if scores else None
+            
+            # LLM Scoring Prompts erstellen
+            scoring_prompts = []
+            for doc in top_docs:
+                prompt = self._create_scoring_prompt(query, doc)
+                scoring_prompts.append(prompt)
+            
+            # Batch-LLM-Inferenz
+            if hasattr(self, 'batch_processor') and self.batch_processor:
+                result = await self.batch_processor.async_batch_generate(
+                    prompts=scoring_prompts,
+                    max_tokens=10,
+                    temperature=self.config.llm_temperature
+                )
+                llm_responses = result.outputs
+            elif self.llm_handler:
+                llm_responses = await self.llm_handler.batch_inference(
+                    prompts=scoring_prompts,
+                    max_tokens=10,
+                    temperature=self.config.llm_temperature
+                )
+            else:
+                raise ValueError("Kein LLM Handler verfügbar")
+            
+            # Scores aus LLM-Antworten extrahieren
+            llm_scores = []
+            for response in llm_responses:
+                score = self._extract_score_from_response(response)
+                llm_scores.append(score)
+            
+            # Kombiniere mit Original-Scores
+            if top_scores:
+                combined_scores = [
+                    0.7 * llm_score + 0.3 * orig_score
+                    for llm_score, orig_score in zip(llm_scores, top_scores)
+                ]
+            else:
+                combined_scores = llm_scores
+            
+            # Sortieren
+            sorted_items = sorted(
+                zip(top_docs, combined_scores, range(len(top_docs))),
+                key=lambda x: x[1],
+                reverse=True
+            )
+            
+            reranked_docs, reranked_scores, original_indices = zip(*sorted_items)
+            
+            # Verbleibende Dokumente anhängen
+            remaining_docs = documents[self.config.max_documents_for_llm:]
+            remaining_scores = scores[self.config.max_documents_for_llm:] if scores else [0.1] * len(remaining_docs)
+            remaining_indices = list(range(self.config.max_documents_for_llm, len(documents)))
+            
+            final_docs = list(reranked_docs) + remaining_docs
+            final_scores = list(reranked_scores) + remaining_scores
+            final_indices = list(original_indices) + remaining_indices
+            
+            self.stats['llm_reranks'] += 1
+            
+            return RerankResult(
+                documents=final_docs,
+                scores=final_scores,
+                original_indices=final_indices,
+                method_used=RerankMethod.LLM_SCORING,
+                processing_time=0.0,
+                metadata={
+                    'llm_processed_docs': len(top_docs),
+                    'total_docs': len(documents),
+                    'avg_llm_score': sum(llm_scores) / len(llm_scores) if llm_scores else 0
+                }
+            )
+            
+        except Exception as e:
+            logger.warning(f"LLM Scoring Reranking fehlgeschlagen: {e}")
+            return await self._bm25_rerank(query, documents, scores)
+    
+    async def _llm_pairwise_rerank(
+        self,
+        query: str,
+        documents: List[str],
+        scores: Optional[List[float]]
+    ) -> RerankResult:
+        """LLM-basiertes Pairwise Comparison Reranking"""
+        
+        if not self._can_use_llm() or len(documents) < 2:
+            return await self._llm_scoring_rerank(query, documents, scores)
+        
+        try:
+            # Für große Listen: Nutze nur Top-K für Pairwise
+            top_docs = documents[:min(10, len(documents))]  # Maximal 10 für Pairwise
+            
+            # Einfache pairwise comparison (vereinfacht)
+            comparison_scores = [0] * len(top_docs)
+            
+            # Erstelle Comparison-Prompts
+            comparison_prompts = []
+            comparisons = []
+            
+            for i in range(len(top_docs)):
+                for j in range(i + 1, len(top_docs)):
+                    prompt = self._create_pairwise_prompt(query, top_docs[i], top_docs[j])
+                    comparison_prompts.append(prompt)
+                    comparisons.append((i, j))
+            
+            # Batch-LLM für Comparisons
+            if comparison_prompts:
+                if hasattr(self, 'batch_processor') and self.batch_processor:
+                    result = await self.batch_processor.async_batch_generate(
+                        prompts=comparison_prompts,
+                        max_tokens=5,
+                        temperature=self.config.llm_temperature
+                    )
+                    comparison_results = result.outputs
+                elif self.llm_handler:
+                    comparison_results = await self.llm_handler.batch_inference(
+                        prompts=comparison_prompts,
+                        max_tokens=5,
+                        temperature=self.config.llm_temperature
+                    )
+                else:
+                    raise ValueError("Kein LLM Handler verfügbar")
+                
+                # Scores aus Comparisons berechnen
+                for (i, j), result in zip(comparisons, comparison_results):
+                    winner = self._extract_winner_from_comparison(result)
+                    if winner == 1:  # Erstes Dokument gewinnt
+                        comparison_scores[i] += 1
+                    elif winner == 2:  # Zweites Dokument gewinnt
+                        comparison_scores[j] += 1
+            
+            # Normalisiere Scores
+            max_score = max(comparison_scores) if comparison_scores else 1
+            normalized_scores = [score / max_score for score in comparison_scores] if max_score > 0 else comparison_scores
+            
+            # Sortieren
+            sorted_items = sorted(
+                zip(top_docs, normalized_scores, range(len(top_docs))),
+                key=lambda x: x[1],
+                reverse=True
+            )
+            
+            reranked_docs, reranked_scores, original_indices = zip(*sorted_items)
+            
+            # Verbleibende Dokumente anhängen
+            remaining_docs = documents[len(top_docs):]
+            remaining_scores = scores[len(top_docs):] if scores else [0.1] * len(remaining_docs)
+            remaining_indices = list(range(len(top_docs), len(documents)))
+            
+            final_docs = list(reranked_docs) + remaining_docs
+            final_scores = list(reranked_scores) + remaining_scores
+            final_indices = list(original_indices) + remaining_indices
+            
+            return RerankResult(
+                documents=final_docs,
+                scores=final_scores,
+                original_indices=final_indices,
+                method_used=RerankMethod.LLM_PAIRWISE,
+                processing_time=0.0,
+                metadata={
+                    'pairwise_comparisons': len(comparison_prompts),
+                    'processed_docs': len(top_docs)
+                }
+            )
+            
+        except Exception as e:
+            logger.warning(f"LLM Pairwise Reranking fehlgeschlagen: {e}")
+            return await self._llm_scoring_rerank(query, documents, scores)
+    
+    async def _hybrid_rerank(
+        self,
+        query: str,
+        documents: List[str],
+        scores: Optional[List[float]]
+    ) -> RerankResult:
+        """Hybrid-Reranking kombiniert mehrere Methoden"""
+        
+        try:
+            # 1. BM25 Scores
+            bm25_result = await self._bm25_rerank(query, documents, scores)
+            
+            # 2. LLM Scores (falls verfügbar)
+            if self._can_use_llm() and len(documents) <= self.config.max_documents_for_llm:
+                llm_result = await self._llm_scoring_rerank(query, documents, scores)
+                
+                # Kombiniere BM25 und LLM Scores
+                max_bm25 = max(bm25_result.scores) if bm25_result.scores else 1
+                max_llm = max(llm_result.scores) if llm_result.scores else 1
+                
+                hybrid_scores = []
+                for i, (bm25_score, llm_score) in enumerate(zip(bm25_result.scores, llm_result.scores)):
+                    # 60% LLM, 40% BM25
+                    hybrid_score = 0.6 * (llm_score / max_llm) + 0.4 * (bm25_score / max_bm25)
+                    hybrid_scores.append(hybrid_score)
+                
+                # Diversität hinzufügen
+                if self.config.diversity_factor > 0:
+                    hybrid_scores = self._add_diversity(documents, hybrid_scores)
+                
+                # Final sortieren
+                sorted_items = sorted(
+                    zip(documents, hybrid_scores, range(len(documents))),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                
+                reranked_docs, reranked_scores, original_indices = zip(*sorted_items)
+                
+                return RerankResult(
+                    documents=list(reranked_docs),
+                    scores=list(reranked_scores),
+                    original_indices=list(original_indices),
+                    method_used=RerankMethod.HYBRID,
+                    processing_time=0.0,
+                    metadata={
+                        'bm25_weight': 0.4,
+                        'llm_weight': 0.6,
+                        'diversity_factor': self.config.diversity_factor,
+                        'llm_available': True
+                    }
+                )
+            else:
+                # Fallback: Nur BM25 + TF-IDF
+                tfidf_result = await self._tfidf_rerank(query, documents, scores)
+                
+                # Kombiniere BM25 und TF-IDF
+                max_bm25 = max(bm25_result.scores) if bm25_result.scores else 1
+                max_tfidf = max(tfidf_result.scores) if tfidf_result.scores else 1
+                
+                hybrid_scores = [
+                    0.6 * (bm25 / max_bm25) + 0.4 * (tfidf / max_tfidf)
+                    for bm25, tfidf in zip(bm25_result.scores, tfidf_result.scores)
+                ]
+                
+                # Sortieren
+                sorted_items = sorted(
+                    zip(documents, hybrid_scores, range(len(documents))),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                
+                reranked_docs, reranked_scores, original_indices = zip(*sorted_items)
+                
+                return RerankResult(
+                    documents=list(reranked_docs),
+                    scores=list(reranked_scores),
+                    original_indices=list(original_indices),
+                    method_used=RerankMethod.HYBRID,
+                    processing_time=0.0,
+                    metadata={
+                        'bm25_weight': 0.6,
+                        'tfidf_weight': 0.4,
+                        'llm_available': False
+                    }
+                )
+                
+        except Exception as e:
+            logger.warning(f"Hybrid Reranking fehlgeschlagen: {e}")
+            return await self._bm25_rerank(query, documents, scores)
+    
+    # Batch-Processing Methoden
+    
+    async def _batch_llm_rerank(
+        self,
+        queries: List[str],
+        document_lists: List[List[str]],
+        score_lists: Optional[List[List[float]]],
+        method: RerankMethod
+    ) -> List[RerankResult]:
+        """Batch-LLM-Reranking für optimale Performance"""
+        
+        try:
+            # Alle LLM-Prompts sammeln
+            all_prompts = []
+            prompt_mapping = []  # (query_idx, doc_idx)
+            
+            for query_idx, (query, documents) in enumerate(zip(queries, document_lists)):
+                # Limitiere auf Top-K für LLM
+                top_docs = documents[:self.config.max_documents_for_llm]
+                
+                for doc_idx, doc in enumerate(top_docs):
+                    if method == RerankMethod.LLM_SCORING:
+                        prompt = self._create_scoring_prompt(query, doc)
+                    else:  # LLM_PAIRWISE oder HYBRID
+                        prompt = self._create_scoring_prompt(query, doc)
+                    
+                    all_prompts.append(prompt)
+                    prompt_mapping.append((query_idx, doc_idx))
+            
+            # Batch-LLM-Inferenz
+            if hasattr(self, 'batch_processor') and self.batch_processor:
+                batch_result = await self.batch_processor.async_batch_generate(
+                    prompts=all_prompts,
+                    max_tokens=10,
+                    temperature=self.config.llm_temperature
+                )
+                all_responses = batch_result.outputs
+            elif self.llm_handler:
+                all_responses = await self.llm_handler.batch_inference(
+                    prompts=all_prompts,
+                    max_tokens=10,
+                    temperature=self.config.llm_temperature
+                )
+            else:
+                raise ValueError("Kein LLM Handler verfügbar")
+            
+            # Responses zu Queries zuordnen
+            query_responses = [[] for _ in queries]
+            for (query_idx, doc_idx), response in zip(prompt_mapping, all_responses):
+                query_responses[query_idx].append((doc_idx, response))
+            
+            # Ergebnisse für jede Query erstellen
+            results = []
+            for query_idx, (query, documents) in enumerate(zip(queries, document_lists)):
+                scores = score_lists[query_idx] if score_lists else None
+                responses = query_responses[query_idx]
+                
+                # LLM-Scores extrahieren
+                llm_scores = [0.0] * len(documents)
+                for doc_idx, response in responses:
+                    if doc_idx < len(documents):
+                        score = self._extract_score_from_response(response)
+                        llm_scores[doc_idx] = score
+                
+                # Kombiniere mit Original-Scores
+                if scores:
+                    max_llm = max(llm_scores) if any(s > 0 for s in llm_scores) else 1
+                    max_orig = max(scores) if scores else 1
+                    
+                    combined_scores = [
+                        0.7 * (llm / max_llm) + 0.3 * (orig / max_orig)
+                        for llm, orig in zip(llm_scores, scores)
+                    ]
+                else:
+                    combined_scores = llm_scores
+                
+                # Sortieren
+                sorted_items = sorted(
+                    zip(documents, combined_scores, range(len(documents))),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                
+                reranked_docs, reranked_scores, original_indices = zip(*sorted_items)
+                
+                result = RerankResult(
+                    documents=list(reranked_docs),
+                    scores=list(reranked_scores),
+                    original_indices=list(original_indices),
+                    method_used=method,
+                    processing_time=0.0,
+                    metadata={
+                        'llm_responses': len(responses),
+                        'batch_processed': True
+                    }
+                )
+                results.append(result)
+            
+            self.stats['llm_reranks'] += len(queries)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Batch-LLM-Reranking fehlgeschlagen: {e}")
+            # Fallback: Sequentielle Verarbeitung
+            return await self._sequential_rerank(queries, document_lists, score_lists, method)
+    
+    async def _sequential_rerank(
+        self,
+        queries: List[str],
+        document_lists: List[List[str]],
+        score_lists: Optional[List[List[float]]],
+        method: RerankMethod
+    ) -> List[RerankResult]:
+        """Sequentielle Verarbeitung als Fallback"""
+        
+        results = []
+        for i, (query, documents) in enumerate(zip(queries, document_lists)):
+            scores = score_lists[i] if score_lists else None
+            
+            try:
+                result = await self._execute_reranking(query, documents, scores, method)
+                results.append(result)
+            except Exception as e:
+                logger.warning(f"Sequentielles Reranking für Query {i} fehlgeschlagen: {e}")
+                # Fallback: Original-Reihenfolge
+                fallback_result = RerankResult(
+                    documents=documents,
+                    scores=scores or [1.0] * len(documents),
+                    original_indices=list(range(len(documents))),
+                    method_used=RerankMethod.SIMILARITY_SCORE,
+                    processing_time=0.0,
+                    metadata={'error': str(e)}
+                )
+                results.append(fallback_result)
         
         return results
+    
+    async def _parallel_non_llm_rerank(
+        self,
+        queries: List[str],
+        document_lists: List[List[str]],
+        score_lists: Optional[List[List[float]]],
+        method: RerankMethod
+    ) -> List[RerankResult]:
+        """Parallele Verarbeitung für Non-LLM Methoden"""
+        
+        tasks = []
+        for i, (query, documents) in enumerate(zip(queries, document_lists)):
+            scores = score_lists[i] if score_lists else None
+            task = self._execute_reranking(query, documents, scores, method)
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Exception-Handling
+        final_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.warning(f"Paralleles Reranking für Query {i} fehlgeschlagen: {result}")
+                # Fallback
+                documents = document_lists[i]
+                scores = score_lists[i] if score_lists else [1.0] * len(documents)
+                fallback_result = RerankResult(
+                    documents=documents,
+                    scores=scores,
+                    original_indices=list(range(len(documents))),
+                    method_used=RerankMethod.SIMILARITY_SCORE,
+                    processing_time=0.0,
+                    metadata={'error': str(result)}
+                )
+                final_results.append(fallback_result)
+            else:
+                final_results.append(result)
+        
+        return final_results
+    
+    # Utility-Methoden
+    
+    def _can_use_llm(self) -> bool:
+        """Prüft ob LLM-Reranking verfügbar ist"""
+        return (
+            (hasattr(self, 'batch_processor') and self.batch_processor) or
+            (self.llm_handler is not None)
+        )
+    
+    def _can_use_batch_llm(self) -> bool:
+        """Prüft ob Batch-LLM verfügbar ist"""
+        return (
+            self.config.enable_batch_llm and
+            ((hasattr(self, 'batch_processor') and self.batch_processor) or 
+             (self.llm_handler and hasattr(self.llm_handler, 'batch_inference')))
+        )
+    
+    def _create_scoring_prompt(self, query: str, document: str) -> str:
+        """Erstellt LLM-Prompt für Dokument-Scoring"""
+        
+        # Dokumenttext kürzen falls zu lang
+        max_doc_length = 500
+        if len(document) > max_doc_length:
+            document = document[:max_doc_length] + "..."
+        
+        prompt = f"""Bewerte wie relevant das folgende Dokument für die gegebene Frage ist.
 
-# Usage Examples
-async def example_usage():
-    """Beispiele für Re-ranking Engine Usage"""
+Frage: {query}
+
+Dokument: {document}
+
+Bewertung (0-10, wobei 10 = sehr relevant, 0 = nicht relevant):"""
+        
+        return prompt
     
-    # Initialize with config
-    config = ReRankConfig(
-        top_k=5,
-        diversity_factor=0.3,
-        enable_diversity_rerank=True
-    )
+    def _create_pairwise_prompt(self, query: str, doc1: str, doc2: str) -> str:
+        """Erstellt LLM-Prompt für Pairwise Comparison"""
+        
+        max_doc_length = 300
+        if len(doc1) > max_doc_length:
+            doc1 = doc1[:max_doc_length] + "..."
+        if len(doc2) > max_doc_length:
+            doc2 = doc2[:max_doc_length] + "..."
+        
+        prompt = f"""Welches Dokument ist relevanter für die gegebene Frage?
+
+Frage: {query}
+
+Dokument A: {doc1}
+
+Dokument B: {doc2}
+
+Antwort (A oder B):"""
+        
+        return prompt
     
-    rerank_engine = MLXRerankEngine(config)
+    def _extract_score_from_response(self, response: str) -> float:
+        """Extrahiert numerischen Score aus LLM-Response"""
+        try:
+            # Suche nach Zahlen in der Antwort
+            numbers = re.findall(r'\b\d+(?:\.\d+)?\b', response)
+            
+            if numbers:
+                score = float(numbers[0])
+                # Normalisiere auf 0-1 Range
+                if score > 10:
+                    score = score / 100  # Falls Prozent angegeben
+                elif score > 1:
+                    score = score / 10   # Falls 0-10 Scale
+                
+                return min(1.0, max(0.0, score))
+            else:
+                # Fallback: Text-basierte Bewertung
+                response_lower = response.lower()
+                if any(word in response_lower for word in ['sehr relevant', 'hoch', 'excellent', 'perfect']):
+                    return 0.9
+                elif any(word in response_lower for word in ['relevant', 'gut', 'good']):
+                    return 0.7
+                elif any(word in response_lower for word in ['teilweise', 'mittel', 'ok']):
+                    return 0.5
+                elif any(word in response_lower for word in ['wenig', 'niedrig', 'schlecht']):
+                    return 0.3
+                else:
+                    return 0.1
+                    
+        except Exception as e:
+            logger.debug(f"Score-Extraktion fehlgeschlagen: {e}")
+            return 0.5  # Neutraler Fallback-Score
     
-    # Test candidates (simulate vector search results)
-    candidates = [
-        {
-            "id": "doc_1",
-            "content": "Machine learning is a subset of artificial intelligence that focuses on algorithms.",
-            "metadata": {"title": "ML Basics", "timestamp": "2024-01-01T00:00:00"},
-            "score": 0.85
-        },
-        {
-            "id": "doc_2", 
-            "content": "Neural networks are computing systems inspired by biological neural networks.",
-            "metadata": {"title": "Neural Networks", "timestamp": "2024-01-02T00:00:00"},
-            "score": 0.82
-        },
-        {
-            "id": "doc_3",
-            "content": "Deep learning uses neural networks with multiple layers to model complex patterns.",
-            "metadata": {"title": "Deep Learning", "timestamp": "2024-01-03T00:00:00"},
-            "score": 0.80
+    def _extract_winner_from_comparison(self, response: str) -> int:
+        """Extrahiert Gewinner aus Pairwise Comparison Response"""
+        try:
+            response_lower = response.lower().strip()
+            
+            # Suche nach A oder B
+            if 'a' in response_lower and 'b' not in response_lower:
+                return 1
+            elif 'b' in response_lower and 'a' not in response_lower:
+                return 2
+            elif response_lower.startswith('a'):
+                return 1
+            elif response_lower.startswith('b'):
+                return 2
+            else:
+                return 0  # Unentschieden
+                
+        except Exception as e:
+            logger.debug(f"Winner-Extraktion fehlgeschlagen: {e}")
+            return 0
+    
+    def _tokenize(self, text: str) -> List[str]:
+        """Einfache Tokenisierung für BM25/TF-IDF"""
+        # Entferne Satzzeichen und teile an Leerzeichen
+        text = re.sub(r'[^\w\s]', ' ', text)
+        tokens = text.split()
+        return [token for token in tokens if len(token) > 1]  # Filtere sehr kurze Tokens
+    
+    def _add_diversity(self, documents: List[str], scores: List[float]) -> List[float]:
+        """Fügt Diversität zu Scores hinzu um Redundanz zu reduzieren"""
+        try:
+            if self.config.diversity_factor <= 0:
+                return scores
+            
+            diverse_scores = scores.copy()
+            processed_docs = set()
+            
+            for i, doc in enumerate(documents):
+                # Einfache Ähnlichkeitsprüfung basierend auf Worten
+                doc_words = set(self._tokenize(doc.lower()))
+                
+                for processed_doc in processed_docs:
+                    processed_words = set(self._tokenize(processed_doc.lower()))
+                    
+                    # Jaccard-Ähnlichkeit
+                    intersection = len(doc_words & processed_words)
+                    union = len(doc_words | processed_words)
+                    similarity = intersection / union if union > 0 else 0
+                    
+                    # Reduziere Score basierend auf Ähnlichkeit
+                    if similarity > 0.5:
+                        diverse_scores[i] *= (1 - self.config.diversity_factor * similarity)
+                
+                processed_docs.add(doc)
+            
+            return diverse_scores
+            
+        except Exception as e:
+            logger.debug(f"Diversitäts-Anpassung fehlgeschlagen: {e}")
+            return scores
+    
+    def _generate_cache_key(
+        self,
+        query: str,
+        documents: List[str],
+        method: RerankMethod
+    ) -> str:
+        """Generiert Cache-Key für Reranking"""
+        import hashlib
+        
+        # Erstelle reproduzierbaren Key
+        key_components = [
+            query,
+            str(sorted(documents)),  # Sortiert für Konsistenz
+            method.value,
+            str(self.config.llm_temperature),
+            str(self.config.max_documents_for_llm)
+        ]
+        
+        key_string = "|".join(key_components)
+        return hashlib.md5(key_string.encode()).hexdigest()
+    
+    def _update_stats(self, count: int, processing_time: float, method: RerankMethod):
+        """Aktualisiert Performance-Statistiken"""
+        self.stats['total_reranks'] += count
+        self.stats['method_usage'][method.value] += count
+        
+        # Gleitender Durchschnitt für Processing Time
+        if self.stats['avg_processing_time'] == 0:
+            self.stats['avg_processing_time'] = processing_time
+        else:
+            self.stats['avg_processing_time'] = (
+                self.stats['avg_processing_time'] * 0.9 + processing_time * 0.1
+            )
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Gibt Performance-Statistiken zurück"""
+        
+        # Cache Hit Rate
+        total_cache_requests = self.stats['cache_hits'] + self.stats['cache_misses']
+        cache_hit_rate = (
+            self.stats['cache_hits'] / total_cache_requests 
+            if total_cache_requests > 0 else 0
+        )
+        
+        return {
+            **self.stats,
+            'cache_hit_rate': cache_hit_rate,
+            'cache_size': len(self.cache) if self.cache else 0,
+            'llm_available': self._can_use_llm(),
+            'batch_llm_available': self._can_use_batch_llm(),
+            'config': {
+                'primary_method': self.config.primary_method.value,
+                'max_llm_batch_size': self.config.max_llm_batch_size,
+                'max_documents_for_llm': self.config.max_documents_for_llm,
+                'diversity_factor': self.config.diversity_factor
+            }
         }
-    ]
     
-    # Standard reranking
-    query = "What is machine learning?"
+    def clear_cache(self):
+        """Leert den Reranking-Cache"""
+        if self.cache:
+            self.cache.clear()
+            self.stats['cache_hits'] = 0
+            self.stats['cache_misses'] = 0
+            logger.info("Reranking Cache geleert")
     
-    rerank_result = await rerank_engine.rerank(
-        query=query,
-        candidates=candidates,
-        top_k=5,
-        algorithm="balanced"
+    async def cleanup(self):
+        """Cleanup-Methode"""
+        if hasattr(self, 'batch_processor') and self.batch_processor:
+            self.batch_processor.cleanup()
+        
+        if self.cache:
+            self.cache.clear()
+        
+        logger.info("Rerank Engine Cleanup abgeschlossen")
+
+
+# Utility Functions
+
+async def create_rerank_engine(
+    method: RerankMethod = RerankMethod.HYBRID,
+    llm_model: str = "mlx-community/Llama-3.2-3B-Instruct-4bit",
+    enable_batch_llm: bool = True,
+    llm_handler=None
+) -> MLXRerankEngine:
+    """Factory Function für Rerank Engine"""
+    
+    config = RerankConfig(
+        primary_method=method,
+        llm_model=llm_model,
+        enable_batch_llm=enable_batch_llm
     )
     
-    print(f"Reranked {rerank_result.total_candidates} candidates")
-    print(f"Processing time: {rerank_result.processing_time:.3f}s")
-    print(f"Algorithm used: {rerank_result.algorithm_used}")
-    
-    for i, candidate in enumerate(rerank_result.candidates):
-        print(f"  {i+1}. {candidate.id}: {candidate.final_score:.3f} (was {candidate.original_score:.3f})")
-    
-    # Performance stats
-    stats = rerank_engine.get_performance_stats()
-    print(f"Performance stats: {stats}")
-    
-    # Benchmark
-    benchmark_results = await rerank_engine.benchmark()
-    print(f"Benchmark results: {benchmark_results}")
+    engine = MLXRerankEngine(config)
+    await engine.initialize(llm_handler)
+    return engine
 
-if __name__ == "__main__":
-    asyncio.run(example_usage())
+
+async def benchmark_rerank_performance(
+    engine: MLXRerankEngine,
+    test_queries: Optional[List[str]] = None,
+    test_documents: Optional[List[List[str]]] = None
+) -> Dict[str, Any]:
+    """Benchmark für Reranking-Performance"""
+    
+    if test_queries is None:
+        test_queries = [
+            "Was ist Machine Learning?",
+            "Wie funktioniert Apple Silicon?",
+            "Vorteile von MLX Framework",
+            "Performance-Optimierung für Apple Silicon"
+        ]
+    
+    if test_documents is None:
+        # Generiere Test-Dokumente
+        base_docs = [
+            "Machine Learning ist ein Teilbereich der künstlichen Intelligenz.",
+            "Apple Silicon nutzt ARM-basierte Prozessoren für bessere Effizienz.",
+            "MLX Framework ist optimiert für Apple Silicon Hardware.",
+            "Unified Memory Architecture bietet Performance-Vorteile.",
+            "Neural Engine beschleunigt Machine Learning Operationen.",
+            "Metal Performance Shaders ermöglichen GPU-Computing.",
+            "Performance-Optimierung erfordert Hardware-spezifische Anpassungen.",
+            "Batch-Processing kann die Durchsatzrate erheblich steigern."
+        ]
+        
+        test_documents = [base_docs for _ in test_queries]
+    
+    # Single Reranking Benchmark
+    single_times = []
+    for query, documents in zip(test_queries, test_documents):
+        start_time = time.time()
+        result = await engine.rerank_with_scores(query, documents)
+        single_time = time.time() - start_time
+        single_times.append(single_time)
+    
+    avg_single_time = sum(single_times) / len(single_times)
+    
+    # Batch Reranking Benchmark
+    start_time = time.time()
+    batch_result = await engine.batch_rerank(test_queries, test_documents)
+    batch_time = time.time() - start_time
+    
+    return {
+        'single_reranking': {
+            'avg_time_per_query': avg_single_time,
+            'total_time': sum(single_times),
+            'queries_count': len(test_queries)
+        },
+        'batch_reranking': {
+            'total_time': batch_time,
+            'queries_count': len(test_queries),
+            'avg_time_per_query': batch_time / len(test_queries),
+            'successful_queries': batch_result.successful_queries,
+            'speedup': sum(single_times) / batch_time if batch_time > 0 else 0
+        },
+        'performance_stats': engine.get_performance_stats()
+    }
+
+
+def get_rerank_method_recommendations(
+    document_count: int,
+    query_complexity: str = "medium",  # "simple", "medium", "complex"
+    llm_available: bool = True
+) -> RerankMethod:
+    """Empfiehlt optimale Reranking-Methode basierend auf Kontext"""
+    
+    if document_count <= 5:
+        # Wenige Dokumente: LLM-basiert falls verfügbar
+        return RerankMethod.LLM_PAIRWISE if llm_available else RerankMethod.BM25
+    elif document_count <= 20:
+        # Mittlere Anzahl: LLM-Scoring oder Hybrid
+        if llm_available:
+            return RerankMethod.HYBRID if query_complexity == "complex" else RerankMethod.LLM_SCORING
+        else:
+            return RerankMethod.BM25
+    else:
+        # Viele Dokumente: Effiziente Methoden
+        if llm_available and query_complexity == "complex":
+            return RerankMethod.HYBRID  # LLM nur für Top-K
+        else:
+            return RerankMethod.BM25 if query_complexity == "simple" else RerankMethod.TFIDF

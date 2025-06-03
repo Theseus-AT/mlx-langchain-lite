@@ -1,498 +1,569 @@
 """
-MLX Embedding Engine
-Optimiert für Apple Silicon mit MLX Framework
-Unterstützt verschiedene Embedding-Modelle und Batch-Processing
+MLX Embedding Engine - Enhanced mit MLX Parallels Integration
+Batch-Embedding-Generierung für optimale Performance mit mlx-vector-db
 """
 
 import asyncio
 import time
-from pathlib import Path
-from typing import List, Optional, Dict, Any, Union, Tuple
-from dataclasses import dataclass
-import json
+import logging
+from typing import List, Dict, Any, Optional, Union, Tuple
+from dataclasses import dataclass, field
 import hashlib
+import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm import load, generate
-import numpy as np
+from mlx_lm import load
+
+# MLX Parallels Integration
+try:
+    from mlx_parallels.core.batch_processor import BatchProcessor, EmbeddingResult
+    from mlx_parallels.core.config import (
+        MLXParallelsConfig, ModelConfig, BatchConfig, EmbeddingConfig,
+        get_embedding_config
+    )
+    BATCH_PROCESSING_AVAILABLE = True
+except ImportError:
+    BATCH_PROCESSING_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
-class EmbeddingConfig:
+class EmbeddingEngineConfig:
     """Konfiguration für Embedding Engine"""
-    model_path: str = "mlx-community/gte-small"
-    max_sequence_length: int = 512
-    batch_size: int = 32
-    normalize_embeddings: bool = True
-    cache_embeddings: bool = True
-    cache_size: int = 1000
-    device: str = "auto"  # auto, cpu, gpu
+    model_name: str = "mlx-community/gte-small"
+    max_batch_size: int = 128
+    embedding_dim: int = 384
+    normalize: bool = True
+    pooling_method: str = "mean"  # "mean", "max", "cls"
+    cache_enabled: bool = True
+    cache_size: int = 10000
+    trust_remote_code: bool = True
+    
+    # Performance Settings
+    enable_batch_processing: bool = True
+    performance_mode: str = "balanced"  # "fast", "balanced", "throughput"
+    chunk_size: int = 2000
+    overlap: int = 50
 
-@dataclass
-class EmbeddingResult:
-    """Result-Container für Embeddings"""
-    embeddings: mx.array
-    texts: List[str]
-    model_name: str
-    processing_time: float
-    cached_count: int = 0
 
 class MLXEmbeddingEngine:
     """
-    High-Performance Embedding Engine für MLX
+    Enhanced MLX Embedding Engine mit Batch-Processing
     
     Features:
-    - Multiple Embedding Models Support
-    - Intelligent Caching System
-    - Batch Processing Optimization
-    - Memory-Efficient Operations
-    - Apple Silicon Optimization
+    - Batch-Embedding für dramatisch bessere Performance
+    - Integration mit mlx-vector-db
+    - Multi-User Support
+    - Intelligent Caching
+    - MLX-optimiert für Apple Silicon
     """
     
-    def __init__(self, config: EmbeddingConfig = None):
-        self.config = config or EmbeddingConfig()
+    def __init__(self, config: EmbeddingEngineConfig):
+        self.config = config
         self.model = None
         self.tokenizer = None
-        self.model_name = None
-        self.embedding_dim = None
+        self.model_loaded = False
         
-        # Caching System
-        self.cache = {}
-        self.cache_hits = 0
-        self.cache_misses = 0
+        # Caching
+        self._cache = {} if config.cache_enabled else None
+        self._cache_hits = 0
+        self._cache_misses = 0
         
-        # Performance Metrics
-        self.total_embeddings = 0
-        self.total_processing_time = 0.0
-        
-        # Supported Models
-        self.supported_models = {
-            "gte-small": "mlx-community/gte-small",
-            "gte-large": "mlx-community/gte-large", 
-            "all-MiniLM-L6-v2": "mlx-community/all-MiniLM-L6-v2",
-            "bge-small-en": "mlx-community/bge-small-en",
-            "bge-large-en": "mlx-community/bge-large-en",
-            "e5-small-v2": "mlx-community/e5-small-v2",
-            "e5-large-v2": "mlx-community/e5-large-v2"
+        # Performance Tracking
+        self.stats = {
+            'total_embeddings': 0,
+            'total_time': 0.0,
+            'avg_embeddings_per_sec': 0.0,
+            'cache_hit_rate': 0.0,
+            'batch_requests': 0,
+            'single_requests': 0
         }
-    
-    async def initialize(self, model_path: Optional[str] = None) -> None:
-        """
-        Lazy Model Loading für Memory Efficiency
-        """
-        target_model = model_path or self.config.model_path
         
-        if self.model is None or self.model_name != target_model:
-            print(f"Loading embedding model: {target_model}")
+        # MLX Parallels Integration
+        if BATCH_PROCESSING_AVAILABLE and config.enable_batch_processing:
+            try:
+                mlx_config = get_embedding_config(config.model_name)
+                # Override mit unseren Settings
+                mlx_config.batch.max_batch_size = config.max_batch_size
+                mlx_config.embedding.normalize = config.normalize
+                mlx_config.embedding.pooling_method = config.pooling_method
+                mlx_config.embedding.chunk_size = config.chunk_size
+                
+                self.batch_processor = BatchProcessor(mlx_config)
+                self.batch_processing_enabled = True
+                logger.info("✅ Embedding Batch-Processing aktiviert")
+            except Exception as e:
+                logger.warning(f"Batch-Processing Initialisierung fehlgeschlagen: {e}")
+                self.batch_processor = None
+                self.batch_processing_enabled = False
+        else:
+            self.batch_processor = None
+            self.batch_processing_enabled = False
+            
+        logger.info(f"EmbeddingEngine initialisiert - Modell: {config.model_name}")
+    
+    async def initialize(self) -> bool:
+        """Initialisiert Embedding Engine"""
+        try:
+            # MLX Parallels Batch Processor verwenden falls verfügbar
+            if self.batch_processing_enabled and self.batch_processor:
+                success = self.batch_processor.load_model()
+                if success:
+                    self.model_loaded = True
+                    logger.info("🚀 Enhanced Embedding Engine mit Batch-Processing initialisiert")
+                    return True
+                else:
+                    logger.warning("Batch Processor fehlgeschlagen - fallback zu Legacy")
+            
+            # Legacy-Initialisierung
+            logger.info("🔄 Legacy Embedding Engine wird initialisiert...")
+            
+            self.model, self.tokenizer = load(
+                self.config.model_name,
+                tokenizer_config={
+                    "trust_remote_code": self.config.trust_remote_code
+                }
+            )
+            
+            # Modell evaluieren
+            if hasattr(self.model, 'parameters'):
+                mx.eval(self.model.parameters())
+            
+            self.model_loaded = True
+            logger.info("✅ Legacy Embedding Engine initialisiert")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Embedding Engine Initialisierung fehlgeschlagen: {e}")
+            return False
+    
+    async def encode_text(
+        self,
+        text: str,
+        normalize: Optional[bool] = None,
+        use_cache: bool = True
+    ) -> List[float]:
+        """
+        Einzelnen Text zu Embedding konvertieren
+        Optimiert durch interne Batch-Verarbeitung
+        """
+        return (await self.encode_texts([text], normalize, use_cache))[0]
+    
+    async def encode_texts(
+        self,
+        texts: List[str],
+        normalize: Optional[bool] = None,
+        use_cache: bool = True
+    ) -> List[List[float]]:
+        """
+        Hauptmethode: Batch-Embedding für optimale Performance
+        """
+        if not texts:
+            return []
+        
+        if not self.model_loaded:
+            if not await self.initialize():
+                raise RuntimeError("Embedding Engine konnte nicht initialisiert werden")
+        
+        normalize = normalize if normalize is not None else self.config.normalize
+        
+        # Cache-Check für einzelne Texte
+        embeddings = []
+        texts_to_process = []
+        cache_indices = {}
+        
+        if use_cache and self._cache is not None:
+            for i, text in enumerate(texts):
+                cache_key = self._generate_cache_key(text, normalize)
+                if cache_key in self._cache:
+                    embeddings.append(self._cache[cache_key])
+                    self._cache_hits += 1
+                else:
+                    cache_indices[len(texts_to_process)] = (i, cache_key)
+                    texts_to_process.append(text)
+                    embeddings.append(None)  # Placeholder
+                    self._cache_misses += 1
+        else:
+            texts_to_process = texts
+            embeddings = [None] * len(texts)
+        
+        # Batch-Processing für nicht-gecachte Texte
+        if texts_to_process:
             start_time = time.time()
             
             try:
-                # Load model using MLX
-                self.model, self.tokenizer = load(target_model)
+                if self.batch_processing_enabled and self.batch_processor:
+                    # Enhanced Batch-Processing
+                    result = await self.batch_processor.async_batch_embed(
+                        texts=texts_to_process,
+                        normalize=normalize
+                    )
+                    new_embeddings = result.embeddings
+                    
+                    self.stats['batch_requests'] += 1
+                    logger.debug(f"Batch-Embedding: {len(texts_to_process)} Texte, "
+                               f"{result.embeddings_per_second:.1f} embeddings/s")
+                else:
+                    # Legacy Sequential Processing
+                    new_embeddings = []
+                    for text in texts_to_process:
+                        embedding = await self._encode_single_legacy(text, normalize)
+                        new_embeddings.append(embedding)
+                    
+                    self.stats['single_requests'] += len(texts_to_process)
                 
-                # Ensure model is evaluated and cached in memory
-                mx.eval(self.model.parameters())
+                # Ergebnisse in Original-Reihenfolge einfügen
+                if use_cache and self._cache is not None:
+                    for proc_idx, embedding in enumerate(new_embeddings):
+                        orig_idx, cache_key = cache_indices[proc_idx]
+                        embeddings[orig_idx] = embedding
+                        
+                        # Cache speichern
+                        if len(self._cache) < self.config.cache_size:
+                            self._cache[cache_key] = embedding
+                        elif len(self._cache) >= self.config.cache_size:
+                            # LRU: Entferne ältesten Eintrag
+                            oldest_key = next(iter(self._cache))
+                            del self._cache[oldest_key]
+                            self._cache[cache_key] = embedding
+                else:
+                    embeddings = new_embeddings
                 
-                self.model_name = target_model
-                
-                # Determine embedding dimension
-                self.embedding_dim = await self._get_embedding_dimension()
-                
-                load_time = time.time() - start_time
-                print(f"✅ Model loaded in {load_time:.2f}s, embedding dim: {self.embedding_dim}")
+                # Stats aktualisieren
+                processing_time = time.time() - start_time
+                self._update_stats(len(texts_to_process), processing_time)
                 
             except Exception as e:
-                print(f"❌ Error loading model {target_model}: {e}")
+                logger.error(f"Batch-Embedding fehlgeschlagen: {e}")
                 raise
+        
+        return embeddings
     
-    async def embed(self, 
-                   texts: Union[str, List[str]], 
-                   model_path: Optional[str] = None,
-                   normalize: Optional[bool] = None) -> EmbeddingResult:
-        """
-        Hauptfunktion: Erstellt Embeddings für Text(e)
-        
-        Args:
-            texts: Einzelner Text oder Liste von Texten
-            model_path: Optional anderes Modell verwenden
-            normalize: Override für Normalisierung
-            
-        Returns:
-            EmbeddingResult mit Embeddings und Metadaten
-        """
-        start_time = time.time()
-        
-        # Ensure model is loaded
-        await self.initialize(model_path)
-        
-        # Normalize input
-        if isinstance(texts, str):
-            texts = [texts]
-        
-        if not texts:
-            return EmbeddingResult(
-                embeddings=mx.array([]),
-                texts=[],
-                model_name=self.model_name,
-                processing_time=0.0
-            )
-        
-        # Check cache for existing embeddings
-        cached_embeddings, non_cached_texts, cache_indices = self._check_cache(texts)
-        
-        # Process non-cached texts
-        if non_cached_texts:
-            new_embeddings = await self._compute_embeddings(non_cached_texts)
-            
-            # Update cache
-            self._update_cache(non_cached_texts, new_embeddings)
-        else:
-            new_embeddings = mx.array([])
-        
-        # Combine cached and new embeddings
-        final_embeddings = self._combine_embeddings(
-            cached_embeddings, new_embeddings, cache_indices, texts
-        )
-        
-        # Normalize if requested
-        if normalize if normalize is not None else self.config.normalize_embeddings:
-            final_embeddings = self._normalize_embeddings(final_embeddings)
-        
-        processing_time = time.time() - start_time
-        
-        # Update metrics
-        self.total_embeddings += len(texts)
-        self.total_processing_time += processing_time
-        
-        return EmbeddingResult(
-            embeddings=final_embeddings,
-            texts=texts,
-            model_name=self.model_name,
-            processing_time=processing_time,
-            cached_count=len(texts) - len(non_cached_texts)
-        )
-    
-    async def embed_batch(self, 
-                         text_batches: List[List[str]], 
-                         model_path: Optional[str] = None) -> List[EmbeddingResult]:
-        """
-        Batch Processing für große Mengen von Texten
-        """
-        await self.initialize(model_path)
-        
-        results = []
-        for batch in text_batches:
-            result = await self.embed(batch, model_path)
-            results.append(result)
-        
-        return results
-    
-    async def _compute_embeddings(self, texts: List[str]) -> mx.array:
-        """
-        Core Embedding Computation mit MLX
-        """
+    async def _encode_single_legacy(
+        self,
+        text: str,
+        normalize: bool
+    ) -> List[float]:
+        """Legacy Einzeltext-Encoding für Fallback"""
         try:
-            # Tokenize texts
-            inputs = []
-            for text in texts:
-                # Preprocessing für bessere Embeddings
-                processed_text = self._preprocess_text(text)
-                
-                # Tokenize with proper handling
-                tokens = self.tokenizer.encode(processed_text)
-                
-                # Truncate if necessary
-                if len(tokens) > self.config.max_sequence_length:
-                    tokens = tokens[:self.config.max_sequence_length]
-                
-                inputs.append(tokens)
+            # Text tokenisieren
+            tokens = self.tokenizer.encode(text)
+            if not isinstance(tokens, mx.array):
+                tokens = mx.array(tokens)
             
-            # Batch processing
-            embeddings = []
-            batch_size = self.config.batch_size
+            # Embedding extrahieren
+            embedding = await self._extract_embedding_legacy(tokens)
             
-            for i in range(0, len(inputs), batch_size):
-                batch_inputs = inputs[i:i + batch_size]
-                batch_embeddings = await self._process_batch(batch_inputs)
-                embeddings.extend(batch_embeddings)
+            if normalize:
+                # L2-Normalisierung
+                norm = mx.linalg.norm(embedding)
+                if norm.item() > 0:
+                    embedding = embedding / norm
             
-            return mx.array(embeddings)
-            
-        except Exception as e:
-            print(f"Error computing embeddings: {e}")
-            # Fallback: return zero embeddings
-            return mx.zeros((len(texts), self.embedding_dim or 384))
-    
-    async def _process_batch(self, batch_inputs: List[List[int]]) -> List[List[float]]:
-        """
-        Verarbeitet einen Batch von tokenisierten Inputs
-        """
-        try:
-            # Pad batch to same length
-            max_length = max(len(tokens) for tokens in batch_inputs)
-            padded_inputs = []
-            
-            for tokens in batch_inputs:
-                padded = tokens + [0] * (max_length - len(tokens))
-                padded_inputs.append(padded)
-            
-            # Convert to MLX array
-            input_ids = mx.array(padded_inputs)
-            
-            # Forward pass through model
-            with mx.no_grad():
-                outputs = self.model(input_ids)
-                
-                # Extract embeddings (meist letzter hidden state)
-                if hasattr(outputs, 'last_hidden_state'):
-                    embeddings = outputs.last_hidden_state
-                elif hasattr(outputs, 'hidden_states'):
-                    embeddings = outputs.hidden_states[-1]
-                else:
-                    embeddings = outputs
-                
-                # Mean pooling
-                embeddings = mx.mean(embeddings, axis=1)
-                
-                # Ensure evaluation
-                mx.eval(embeddings)
-                
-                return embeddings.tolist()
+            # Zu Python Liste konvertieren
+            if hasattr(embedding, 'tolist'):
+                return embedding.tolist()
+            else:
+                return [float(x) for x in embedding]
                 
         except Exception as e:
-            print(f"Error in batch processing: {e}")
-            # Fallback
-            return [[0.0] * (self.embedding_dim or 384) for _ in batch_inputs]
+            logger.warning(f"Legacy Encoding fehlgeschlagen: {e}")
+            # Fallback: Null-Embedding
+            return [0.0] * self.config.embedding_dim
     
-    def _preprocess_text(self, text: str) -> str:
-        """
-        Text Preprocessing für bessere Embedding-Qualität
-        """
-        # Basic cleaning
-        text = text.strip()
-        
-        # Remove excessive whitespace
-        text = ' '.join(text.split())
-        
-        # Handle empty text
-        if not text:
-            text = "[EMPTY]"
-        
-        return text
-    
-    def _check_cache(self, texts: List[str]) -> Tuple[Dict[int, mx.array], List[str], Dict[str, int]]:
-        """
-        Prüft Cache für existierende Embeddings
-        """
-        if not self.config.cache_embeddings:
-            return {}, texts, {}
-        
-        cached_embeddings = {}
-        non_cached_texts = []
-        cache_indices = {}
-        
-        for i, text in enumerate(texts):
-            cache_key = self._get_cache_key(text)
+    async def _extract_embedding_legacy(self, tokens: mx.array) -> mx.array:
+        """Legacy Embedding-Extraktion"""
+        try:
+            # Forward pass
+            if tokens.ndim == 1:
+                tokens = tokens.reshape(1, -1)
             
-            if cache_key in self.cache:
-                cached_embeddings[i] = self.cache[cache_key]
-                self.cache_hits += 1
+            if hasattr(self.model, '__call__'):
+                outputs = self.model(tokens)
             else:
-                cache_indices[text] = len(non_cached_texts)
-                non_cached_texts.append(text)
-                self.cache_misses += 1
-        
-        return cached_embeddings, non_cached_texts, cache_indices
-    
-    def _update_cache(self, texts: List[str], embeddings: mx.array) -> None:
-        """
-        Updated Cache mit neuen Embeddings
-        """
-        if not self.config.cache_embeddings:
-            return
-        
-        # Cache size management
-        if len(self.cache) > self.config.cache_size:
-            # Remove oldest entries (simple FIFO)
-            keys_to_remove = list(self.cache.keys())[:len(self.cache) - self.config.cache_size + len(texts)]
-            for key in keys_to_remove:
-                del self.cache[key]
-        
-        # Add new embeddings to cache
-        for i, text in enumerate(texts):
-            cache_key = self._get_cache_key(text)
-            self.cache[cache_key] = embeddings[i]
-    
-    def _combine_embeddings(self, 
-                           cached_embeddings: Dict[int, mx.array], 
-                           new_embeddings: mx.array, 
-                           cache_indices: Dict[str, int], 
-                           original_texts: List[str]) -> mx.array:
-        """
-        Kombiniert gecachte und neue Embeddings in richtiger Reihenfolge
-        """
-        result_embeddings = []
-        new_embedding_idx = 0
-        
-        for i, text in enumerate(original_texts):
-            if i in cached_embeddings:
-                result_embeddings.append(cached_embeddings[i])
+                outputs = self.model.forward(tokens)
+            
+            # Pooling
+            if self.config.pooling_method == "mean":
+                embedding = mx.mean(outputs, axis=1)
+            elif self.config.pooling_method == "max":
+                embedding = mx.max(outputs, axis=1)
+            elif self.config.pooling_method == "cls":
+                embedding = outputs[:, 0]
             else:
-                if new_embedding_idx < len(new_embeddings):
-                    result_embeddings.append(new_embeddings[new_embedding_idx])
-                    new_embedding_idx += 1
-                else:
-                    # Fallback: zero embedding
-                    result_embeddings.append(mx.zeros(self.embedding_dim or 384))
-        
-        return mx.stack(result_embeddings)
+                embedding = mx.mean(outputs, axis=1)
+            
+            return embedding.squeeze(0)
+            
+        except Exception as e:
+            logger.debug(f"Legacy Embedding-Extraktion fehlgeschlagen: {e}")
+            return mx.random.normal((self.config.embedding_dim,))
     
-    def _normalize_embeddings(self, embeddings: mx.array) -> mx.array:
-        """
-        L2-Normalisierung der Embeddings
-        """
-        norms = mx.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms = mx.maximum(norms, 1e-8)  # Avoid division by zero
-        return embeddings / norms
+    # Integration mit mlx-vector-db
     
-    def _get_cache_key(self, text: str) -> str:
+    async def embed_for_vector_db(
+        self,
+        texts: List[str],
+        user_id: str,
+        metadata: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
         """
-        Erstellt Cache-Key für Text
-        """
-        content = f"{self.model_name}:{text}:{self.config.max_sequence_length}"
-        return hashlib.md5(content.encode()).hexdigest()
-    
-    async def _get_embedding_dimension(self) -> int:
-        """
-        Bestimmt Embedding-Dimension des geladenen Modells
+        Spezielle Embedding-Funktion für mlx-vector-db Integration
         """
         try:
-            # Test with dummy input
-            test_embedding = await self._compute_embeddings(["test"])
-            return test_embedding.shape[1]
-        except:
-            # Common dimensions for different models
-            model_dims = {
-                "gte-small": 384,
-                "gte-large": 1024,
-                "all-MiniLM-L6-v2": 384,
-                "bge-small-en": 384,
-                "bge-large-en": 1024,
-                "e5-small-v2": 384,
-                "e5-large-v2": 1024
+            embeddings = await self.encode_texts(texts)
+            
+            # Metadata erweitern
+            if metadata is None:
+                metadata = []
+            
+            # Ensure metadata has same length as texts
+            while len(metadata) < len(texts):
+                metadata.append({})
+            
+            # Add user_id and timestamps to metadata
+            for i, meta in enumerate(metadata):
+                meta.update({
+                    'user_id': user_id,
+                    'text': texts[i],
+                    'timestamp': time.time(),
+                    'embedding_model': self.config.model_name,
+                    'index': i
+                })
+            
+            return {
+                'embeddings': embeddings,
+                'metadata': metadata,
+                'count': len(embeddings),
+                'model': self.config.model_name,
+                'user_id': user_id
             }
             
-            for model_key, dim in model_dims.items():
-                if model_key in self.model_name:
-                    return dim
+        except Exception as e:
+            logger.error(f"Vector DB Embedding fehlgeschlagen: {e}")
+            raise
+    
+    async def embed_documents_chunked(
+        self,
+        documents: List[str],
+        user_id: str,
+        chunk_size: Optional[int] = None,
+        overlap: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Dokumenten-Chunking und Batch-Embedding für große Dokumente
+        """
+        chunk_size = chunk_size or self.config.chunk_size
+        overlap = overlap or self.config.overlap
+        
+        all_chunks = []
+        all_metadata = []
+        
+        for doc_idx, document in enumerate(documents):
+            # Text in Chunks aufteilen
+            chunks = self._chunk_text(document, chunk_size, overlap)
             
-            return 384  # Default fallback
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """
-        Liefert Performance-Statistiken
-        """
-        cache_hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses) if (self.cache_hits + self.cache_misses) > 0 else 0
-        avg_processing_time = self.total_processing_time / self.total_embeddings if self.total_embeddings > 0 else 0
+            for chunk_idx, chunk in enumerate(chunks):
+                all_chunks.append(chunk)
+                all_metadata.append({
+                    'document_id': doc_idx,
+                    'chunk_id': chunk_idx,
+                    'total_chunks': len(chunks),
+                    'chunk_size': len(chunk),
+                    'document_length': len(document)
+                })
         
-        return {
-            "model_name": self.model_name,
-            "embedding_dimension": self.embedding_dim,
-            "total_embeddings": self.total_embeddings,
-            "total_processing_time": self.total_processing_time,
-            "average_processing_time": avg_processing_time,
-            "cache_hits": self.cache_hits,
-            "cache_misses": self.cache_misses,
-            "cache_hit_rate": cache_hit_rate,
-            "cache_size": len(self.cache),
-            "supported_models": list(self.supported_models.keys())
+        # Batch-Embedding für alle Chunks
+        result = await self.embed_for_vector_db(
+            texts=all_chunks,
+            user_id=user_id,
+            metadata=all_metadata
+        )
+        
+        return [{
+            'embeddings': result['embeddings'],
+            'metadata': result['metadata'],
+            'chunks': all_chunks,
+            'total_chunks': len(all_chunks),
+            'total_documents': len(documents)
+        }]
+    
+    def _chunk_text(
+        self,
+        text: str,
+        chunk_size: int,
+        overlap: int
+    ) -> List[str]:
+        """Teilt Text in überlappende Chunks"""
+        if len(text) <= chunk_size:
+            return [text]
+        
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = start + chunk_size
+            chunk = text[start:end]
+            
+            # Versuche an Wortgrenze zu brechen
+            if end < len(text) and not text[end].isspace():
+                last_space = chunk.rfind(' ')
+                if last_space > chunk_size * 0.7:  # Mindestens 70% der Chunk-Größe
+                    chunk = chunk[:last_space]
+                    end = start + last_space
+            
+            chunks.append(chunk.strip())
+            start = end - overlap
+            
+            if start >= len(text):
+                break
+        
+        return [chunk for chunk in chunks if chunk.strip()]
+    
+    def _generate_cache_key(self, text: str, normalize: bool) -> str:
+        """Generiert Cache-Key für Text"""
+        key_components = [
+            text,
+            str(normalize),
+            self.config.model_name,
+            self.config.pooling_method
+        ]
+        key_string = "|".join(key_components)
+        return hashlib.md5(key_string.encode()).hexdigest()
+    
+    def _update_stats(self, count: int, processing_time: float):
+        """Aktualisiert Performance-Statistiken"""
+        self.stats['total_embeddings'] += count
+        self.stats['total_time'] += processing_time
+        
+        if processing_time > 0:
+            current_eps = count / processing_time
+            self.stats['avg_embeddings_per_sec'] = (
+                self.stats['avg_embeddings_per_sec'] * 0.9 + current_eps * 0.1
+            )
+        
+        # Cache Hit Rate
+        total_requests = self._cache_hits + self._cache_misses
+        if total_requests > 0:
+            self.stats['cache_hit_rate'] = self._cache_hits / total_requests
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Gibt Performance-Statistiken zurück"""
+        stats = {
+            **self.stats,
+            'model_loaded': self.model_loaded,
+            'model_name': self.config.model_name,
+            'batch_processing_enabled': self.batch_processing_enabled,
+            'cache_enabled': self._cache is not None,
+            'cache_size': len(self._cache) if self._cache else 0,
+            'config': {
+                'max_batch_size': self.config.max_batch_size,
+                'embedding_dim': self.config.embedding_dim,
+                'normalize': self.config.normalize,
+                'pooling_method': self.config.pooling_method
+            }
         }
+        
+        if self.batch_processing_enabled and self.batch_processor:
+            try:
+                batch_stats = self.batch_processor.get_stats()
+                stats['batch_processor_stats'] = batch_stats
+            except Exception as e:
+                logger.debug(f"Batch Processor Stats fehlgeschlagen: {e}")
+        
+        return stats
     
-    def clear_cache(self) -> None:
-        """
-        Leert den Embedding-Cache
-        """
-        self.cache.clear()
-        self.cache_hits = 0
-        self.cache_misses = 0
+    def clear_cache(self):
+        """Leert den Embedding-Cache"""
+        if self._cache is not None:
+            self._cache.clear()
+            self._cache_hits = 0
+            self._cache_misses = 0
+            logger.info("Embedding Cache geleert")
     
-    async def benchmark(self, texts: List[str] = None) -> Dict[str, float]:
-        """
-        Performance Benchmark für verschiedene Szenarien
-        """
-        if texts is None:
-            texts = [
-                "This is a simple test sentence.",
-                "Here's another sentence for testing the embedding engine.",
-                "A longer sentence with more content to test the processing capabilities of our MLX-based embedding system.",
-                "Short text.",
-                "Medium length text with some technical terms like machine learning, neural networks, and natural language processing.",
-            ] * 10  # 50 texts total
+    async def cleanup(self):
+        """Cleanup-Methode"""
+        if self.batch_processor:
+            self.batch_processor.cleanup()
         
-        print(f"Running benchmark with {len(texts)} texts...")
+        self.model = None
+        self.tokenizer = None
+        self.model_loaded = False
         
-        # Warm up
-        await self.embed(texts[:5])
-        
-        # Clear cache for fair comparison
-        self.clear_cache()
-        
-        # Test without cache
-        start_time = time.time()
-        result_no_cache = await self.embed(texts)
-        time_no_cache = time.time() - start_time
-        
-        # Test with cache (second run)
-        start_time = time.time()
-        result_with_cache = await self.embed(texts)
-        time_with_cache = time.time() - start_time
-        
-        return {
-            "texts_count": len(texts),
-            "time_no_cache": time_no_cache,
-            "time_with_cache": time_with_cache,
-            "speedup_factor": time_no_cache / time_with_cache if time_with_cache > 0 else 0,
-            "embeddings_per_second_no_cache": len(texts) / time_no_cache,
-            "embeddings_per_second_with_cache": len(texts) / time_with_cache,
-            "cache_hit_rate": result_with_cache.cached_count / len(texts)
-        }
+        if self._cache:
+            self._cache.clear()
 
-# Usage Examples
-async def example_usage():
-    """Beispiele für die Nutzung der Embedding Engine"""
-    
-    # Initialize engine
-    config = EmbeddingConfig(
-        model_path="mlx-community/gte-small",
-        batch_size=16,
-        cache_embeddings=True
+
+# Utility Functions
+
+async def create_embedding_engine(
+    model_name: str = "mlx-community/gte-small",
+    enable_batch_processing: bool = True
+) -> MLXEmbeddingEngine:
+    """Factory Function für Embedding Engine"""
+    config = EmbeddingEngineConfig(
+        model_name=model_name,
+        enable_batch_processing=enable_batch_processing
     )
     
     engine = MLXEmbeddingEngine(config)
-    
-    # Single text embedding
-    result = await engine.embed("This is a test sentence.")
-    print(f"Single embedding shape: {result.embeddings.shape}")
-    
-    # Multiple text embeddings
-    texts = [
-        "First document about machine learning.",
-        "Second document about neural networks.", 
-        "Third document about natural language processing."
-    ]
-    
-    result = await engine.embed(texts)
-    print(f"Batch embedding shape: {result.embeddings.shape}")
-    print(f"Processing time: {result.processing_time:.3f}s")
-    print(f"Cached: {result.cached_count}/{len(texts)}")
-    
-    # Performance stats
-    stats = engine.get_stats()
-    print(f"Performance stats: {stats}")
-    
-    # Benchmark
-    benchmark_results = await engine.benchmark()
-    print(f"Benchmark results: {benchmark_results}")
+    await engine.initialize()
+    return engine
 
-if __name__ == "__main__":
-    asyncio.run(example_usage())
+
+def get_compatible_embedding_models() -> List[str]:
+    """Gibt Liste kompatibler Embedding-Modelle zurück"""
+    return [
+        "mlx-community/gte-small",
+        "mlx-community/gte-large",
+        "mlx-community/all-MiniLM-L6-v2", 
+        "mlx-community/bge-small-en",
+        "mlx-community/bge-large-en",
+        "mlx-community/e5-small-v2",
+        "mlx-community/e5-large-v2"
+    ]
+
+
+async def benchmark_embedding_performance(
+    model_name: str,
+    test_texts: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Benchmark für Embedding-Performance"""
+    if test_texts is None:
+        test_texts = [
+            "MLX ist ein Framework für Apple Silicon",
+            "Unified Memory bietet Performance-Vorteile", 
+            "Neural Engine beschleunigt ML-Workloads",
+            "Metal Performance Shaders für GPU-Computing",
+            "ARM-Prozessoren sind energieeffizient"
+        ] * 20  # 100 Test-Texte
+    
+    engine = await create_embedding_engine(model_name)
+    
+    # Single Processing Benchmark
+    start_time = time.time()
+    single_results = []
+    for text in test_texts:
+        embedding = await engine.encode_text(text, use_cache=False)
+        single_results.append(embedding)
+    single_time = time.time() - start_time
+    
+    # Batch Processing Benchmark  
+    start_time = time.time()
+    batch_results = await engine.encode_texts(test_texts, use_cache=False)
+    batch_time = time.time() - start_time
+    
+    await engine.cleanup()
+    
+    return {
+        'model_name': model_name,
+        'test_count': len(test_texts),
+        'single_time': single_time,
+        'batch_time': batch_time,
+        'speedup': single_time / batch_time if batch_time > 0 else 0,
+        'single_eps': len(test_texts) / single_time,
+        'batch_eps': len(test_texts) / batch_time,
+        'embedding_dim': len(batch_results[0]) if batch_results else 0
+    }

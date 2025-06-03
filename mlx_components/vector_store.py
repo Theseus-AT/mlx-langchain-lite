@@ -1,653 +1,759 @@
 """
-MLX Vector Store
-Integration mit mlx-vector-db für High-Performance Vector Operations
-Optimiert für Multi-User Scenarios und Apple Silicon
+MLX Vector Store - Enhanced Integration mit mlx-vector-db
+Batch-Operationen und Multi-User Support für optimale Performance
 """
 
 import asyncio
 import aiohttp
-import json
+import logging
 import time
-from pathlib import Path
 from typing import List, Dict, Any, Optional, Union, Tuple
-from dataclasses import dataclass, asdict
-from datetime import datetime
-import hashlib
+from dataclasses import dataclass, field
+import json
 
-import mlx.core as mx
-import numpy as np
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class VectorStoreConfig:
     """Konfiguration für Vector Store"""
     base_url: str = "http://localhost:8000"
-    api_key: Optional[str] = None
-    timeout: int = 30
-    retry_attempts: int = 3
+    api_key: str = "your-secure-key"
+    default_user_id: str = "default_user"
+    default_model_id: str = "gte-small"
+    
+    # Batch-Processing Settings
+    max_batch_size: int = 100
+    batch_timeout: float = 30.0
+    max_retries: int = 3
     retry_delay: float = 1.0
-    batch_size: int = 100
-    default_k: int = 5
-    max_k: int = 100
+    
+    # Performance Settings
+    connection_timeout: float = 10.0
+    read_timeout: float = 30.0
+    max_connections: int = 10
+
 
 @dataclass
-class VectorDocument:
-    """Dokument für Vector Store"""
-    id: str
-    vector: List[float]
-    metadata: Dict[str, Any]
-    namespace: Optional[str] = None
-    timestamp: Optional[str] = None
-
-@dataclass
-class QueryResult:
-    """Result für Vector Queries"""
-    id: str
+class SearchResult:
+    """Einzelnes Suchergebnis"""
+    content: str
     score: float
-    metadata: Dict[str, Any]
-    vector: Optional[List[float]] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    user_id: Optional[str] = None
+    document_id: Optional[str] = None
+
 
 @dataclass
-class VectorStoreStats:
-    """Statistiken für Vector Store Performance"""
-    total_vectors: int
-    query_latency_ms: float
-    add_latency_ms: float
-    storage_size_mb: float
-    last_updated: str
+class BatchSearchResult:
+    """Batch-Suchergebnis"""
+    results: List[List[SearchResult]]
+    processing_time: float
+    total_queries: int
+    avg_results_per_query: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
 
 class MLXVectorStore:
     """
-    High-Performance Vector Store mit mlx-vector-db Integration
+    Enhanced MLX Vector Store mit Batch-Processing
     
     Features:
-    - Multi-User Support mit User-Isolation
-    - High-Performance Queries (1000+ QPS target)
-    - Batch Operations für Effizienz
-    - Metadata Filtering
-    - Connection Pooling
-    - Automatic Retry Logic
-    - Performance Monitoring
+    - Batch-Add für dramatisch bessere Performance beim Indexieren
+    - Batch-Query für parallele Suche
+    - Multi-User Support mit User-Isolation  
+    - Optimierte Integration mit mlx-vector-db
+    - Robuste Fehlerbehandlung und Retry-Logic
     """
     
-    def __init__(self, config: VectorStoreConfig = None):
-        self.config = config or VectorStoreConfig()
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.stores: Dict[str, Dict[str, bool]] = {}  # Cache für User-Store Status
+    def __init__(self, config: VectorStoreConfig):
+        self.config = config
+        self.session = None
         
-        # Performance Metrics
-        self.query_count = 0
-        self.add_count = 0
-        self.total_query_time = 0.0
-        self.total_add_time = 0.0
-        
-        # Headers für API Requests
-        self.headers = {
-            "Content-Type": "application/json"
+        # Performance Tracking
+        self.stats = {
+            'total_adds': 0,
+            'total_queries': 0,
+            'total_batch_adds': 0,
+            'total_batch_queries': 0,
+            'avg_add_time': 0.0,
+            'avg_query_time': 0.0,
+            'connection_errors': 0,
+            'retry_count': 0
         }
-        if self.config.api_key:
-            self.headers["X-API-Key"] = self.config.api_key
+        
+        logger.info(f"VectorStore initialisiert - Base URL: {config.base_url}")
     
-    async def initialize(self) -> None:
-        """
-        Initialisiert HTTP Session und Connection Pool
-        """
-        if self.session is None:
-            timeout = aiohttp.ClientTimeout(total=self.config.timeout)
-            connector = aiohttp.TCPConnector(
-                limit=100,  # Connection pool size
-                limit_per_host=20,
-                keepalive_timeout=60
-            )
-            
-            self.session = aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers=self.headers
-            )
-            
-            # Health check
-            await self._health_check()
-    
-    async def close(self) -> None:
-        """
-        Schließt HTTP Session
-        """
-        if self.session:
-            await self.session.close()
-            self.session = None
-    
-    async def create_user_store(self, user_id: str, model_id: str) -> bool:
-        """
-        Erstellt Store für User/Model Kombination
-        """
+    async def __aenter__(self):
+        """Async Context Manager Entry"""
         await self.initialize()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async Context Manager Exit"""
+        await self.cleanup()
+    
+    async def initialize(self):
+        """Initialisiert HTTP Session"""
+        timeout = aiohttp.ClientTimeout(
+            connect=self.config.connection_timeout,
+            total=self.config.read_timeout
+        )
         
-        store_key = f"{user_id}:{model_id}"
+        connector = aiohttp.TCPConnector(
+            limit=self.config.max_connections,
+            limit_per_host=self.config.max_connections
+        )
         
-        # Check cache first
-        if store_key in self.stores:
-            return self.stores[store_key]
+        self.session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers={
+                "X-API-Key": self.config.api_key,
+                "Content-Type": "application/json"
+            }
+        )
         
-        payload = {
-            "user_id": user_id,
-            "model_id": model_id
-        }
-        
+        # Health Check
         try:
-            success = await self._make_request(
-                "POST", 
-                "/admin/create_store", 
-                json=payload
-            )
-            
-            self.stores[store_key] = success is not None
-            return self.stores[store_key]
-            
+            await self._health_check()
+            logger.info("✅ Vector Store Verbindung erfolgreich")
         except Exception as e:
-            print(f"Error creating store for {user_id}:{model_id}: {e}")
+            logger.warning(f"⚠️  Health Check fehlgeschlagen: {e}")
+    
+    async def _health_check(self) -> bool:
+        """Überprüft Vector Store Verfügbarkeit"""
+        try:
+            async with self.session.get(f"{self.config.base_url}/monitoring/health") as response:
+                if response.status == 200:
+                    return True
+                else:
+                    logger.warning(f"Health Check Status: {response.status}")
+                    return False
+        except Exception as e:
+            logger.debug(f"Health Check Fehler: {e}")
             return False
     
-    async def add_vectors(self, 
-                         user_id: str, 
-                         model_id: str,
-                         vectors: Union[List[List[float]], mx.array, np.ndarray],
-                         metadata: List[Dict[str, Any]],
-                         ids: Optional[List[str]] = None,
-                         namespace: Optional[str] = None) -> bool:
-        """
-        Fügt Vektoren zum Store hinzu
-        """
-        start_time = time.time()
-        
-        await self.initialize()
-        
-        # Ensure store exists
-        await self.create_user_store(user_id, model_id)
-        
-        # Convert vectors to list format
-        if isinstance(vectors, mx.array):
-            vectors = vectors.tolist()
-        elif isinstance(vectors, np.ndarray):
-            vectors = vectors.tolist()
-        
-        # Generate IDs if not provided
-        if ids is None:
-            ids = [self._generate_id(i, user_id, namespace) for i in range(len(vectors))]
-        
-        # Ensure metadata has same length
-        if len(metadata) != len(vectors):
-            raise ValueError(f"Metadata length ({len(metadata)}) must match vectors length ({len(vectors)})")
-        
-        # Add namespace and timestamp to metadata
-        enriched_metadata = []
-        current_time = datetime.now().isoformat()
-        
-        for i, meta in enumerate(metadata):
-            enriched = meta.copy()
-            enriched.update({
-                "id": ids[i],
-                "namespace": namespace,
-                "timestamp": current_time,
-                "user_id": user_id,
-                "model_id": model_id
-            })
-            enriched_metadata.append(enriched)
-        
-        # Batch processing für große Mengen
-        success = True
-        for i in range(0, len(vectors), self.config.batch_size):
-            batch_vectors = vectors[i:i + self.config.batch_size]
-            batch_metadata = enriched_metadata[i:i + self.config.batch_size]
-            
+    # User/Store Management
+    
+    async def ensure_store_exists(
+        self,
+        user_id: str,
+        model_id: str
+    ) -> bool:
+        """Stellt sicher dass Store für User/Model existiert"""
+        try:
             payload = {
                 "user_id": user_id,
-                "model_id": model_id,
-                "vectors": batch_vectors,
-                "metadata": batch_metadata
+                "model_id": model_id
             }
             
-            try:
-                result = await self._make_request(
-                    "POST",
-                    "/vectors/add",
-                    json=payload
-                )
-                
-                if result is None:
-                    success = False
-                    break
+            async with self.session.post(
+                f"{self.config.base_url}/admin/create_store",
+                json=payload
+            ) as response:
+                if response.status in [200, 201, 409]:  # 409 = Already exists
+                    return True
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Store Creation fehlgeschlagen: {response.status} - {error_text}")
+                    return False
                     
-            except Exception as e:
-                print(f"Error adding vector batch {i}: {e}")
-                success = False
-                break
-        
-        # Update metrics
-        add_time = time.time() - start_time
-        self.add_count += len(vectors)
-        self.total_add_time += add_time
-        
-        return success
+        except Exception as e:
+            logger.error(f"Store Creation Fehler: {e}")
+            return False
     
-    async def query(self, 
-                   user_id: str, 
-                   model_id: str,
-                   query_vector: Union[List[float], mx.array, np.ndarray],
-                   k: Optional[int] = None,
-                   filters: Optional[Dict[str, Any]] = None,
-                   namespace: Optional[str] = None,
-                   include_vectors: bool = False) -> List[QueryResult]:
+    # Batch-Add Operations
+    
+    async def add_vectors_batch(
+        self,
+        embeddings: List[List[float]],
+        metadata: List[Dict[str, Any]],
+        user_id: Optional[str] = None,
+        model_id: Optional[str] = None
+    ) -> bool:
         """
-        Führt Similarity Search durch
+        Batch-Add für optimale Performance beim Indexieren
         """
+        user_id = user_id or self.config.default_user_id
+        model_id = model_id or self.config.default_model_id
+        
+        if len(embeddings) != len(metadata):
+            raise ValueError("Anzahl Embeddings muss Anzahl Metadata entsprechen")
+        
         start_time = time.time()
         
-        await self.initialize()
-        
-        # Convert query vector
-        if isinstance(query_vector, (mx.array, np.ndarray)):
-            query_vector = query_vector.tolist()
-        
-        k = k or self.config.default_k
-        k = min(k, self.config.max_k)
-        
-        payload = {
-            "user_id": user_id,
-            "model_id": model_id,
-            "query": query_vector,
-            "k": k,
-            "include_vectors": include_vectors
-        }
-        
-        # Add filters if provided
-        if filters:
-            payload["filters"] = filters
-        
-        if namespace:
-            if "filters" not in payload:
-                payload["filters"] = {}
-            payload["filters"]["namespace"] = namespace
-        
         try:
-            response = await self._make_request(
-                "POST",
-                "/vectors/query",
-                json=payload
-            )
+            # Store sicherstellen
+            await self.ensure_store_exists(user_id, model_id)
             
-            if response is None:
-                return []
+            # Große Batches aufteilen
+            success_count = 0
+            total_batches = 0
             
-            # Parse results
-            results = []
-            for item in response.get("results", []):
-                result = QueryResult(
-                    id=item.get("id", ""),
-                    score=item.get("score", 0.0),
-                    metadata=item.get("metadata", {}),
-                    vector=item.get("vector") if include_vectors else None
+            for i in range(0, len(embeddings), self.config.max_batch_size):
+                batch_embeddings = embeddings[i:i + self.config.max_batch_size]
+                batch_metadata = metadata[i:i + self.config.max_batch_size]
+                
+                success = await self._add_batch_chunk(
+                    batch_embeddings, batch_metadata, user_id, model_id
                 )
-                results.append(result)
+                
+                if success:
+                    success_count += 1
+                total_batches += 1
+                
+                logger.debug(f"Batch {total_batches} von {(len(embeddings) + self.config.max_batch_size - 1) // self.config.max_batch_size} verarbeitet")
             
-            # Update metrics
-            query_time = time.time() - start_time
-            self.query_count += 1
-            self.total_query_time += query_time
+            processing_time = time.time() - start_time
             
-            return results
+            # Stats aktualisieren
+            self.stats['total_batch_adds'] += 1
+            self.stats['total_adds'] += len(embeddings)
+            self._update_avg_time('add', processing_time)
+            
+            success_rate = success_count / total_batches if total_batches > 0 else 0
+            logger.info(f"Batch-Add abgeschlossen: {len(embeddings)} Vektoren, "
+                       f"{success_rate:.1%} Erfolgsrate, {processing_time:.2f}s")
+            
+            return success_rate > 0.8  # 80% Erfolgsrate als Mindestanforderung
             
         except Exception as e:
-            print(f"Error querying vectors: {e}")
-            return []
+            logger.error(f"Batch-Add fehlgeschlagen: {e}")
+            self.stats['connection_errors'] += 1
+            return False
     
-    async def batch_query(self, 
-                         user_id: str, 
-                         model_id: str,
-                         query_vectors: Union[List[List[float]], mx.array, np.ndarray],
-                         k: Optional[int] = None,
-                         filters: Optional[Dict[str, Any]] = None,
-                         namespace: Optional[str] = None) -> List[List[QueryResult]]:
-        """
-        Batch Query Processing für multiple Queries
-        """
-        await self.initialize()
-        
-        # Convert query vectors
-        if isinstance(query_vectors, (mx.array, np.ndarray)):
-            query_vectors = query_vectors.tolist()
-        
-        k = k or self.config.default_k
+    async def _add_batch_chunk(
+        self,
+        embeddings: List[List[float]],
+        metadata: List[Dict[str, Any]],
+        user_id: str,
+        model_id: str
+    ) -> bool:
+        """Fügt einzelnen Batch-Chunk hinzu mit Retry-Logic"""
         
         payload = {
             "user_id": user_id,
             "model_id": model_id,
-            "queries": query_vectors,
+            "vectors": embeddings,
+            "metadata": metadata
+        }
+        
+        for attempt in range(self.config.max_retries):
+            try:
+                async with self.session.post(
+                    f"{self.config.base_url}/vectors/add",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=self.config.batch_timeout)
+                ) as response:
+                    
+                    if response.status == 200:
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.warning(f"Add Batch Chunk fehlgeschlagen (Versuch {attempt + 1}): "
+                                     f"{response.status} - {error_text}")
+                        
+                        if attempt < self.config.max_retries - 1:
+                            await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
+                        
+            except asyncio.TimeoutError:
+                logger.warning(f"Add Batch Chunk Timeout (Versuch {attempt + 1})")
+                if attempt < self.config.max_retries - 1:
+                    await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
+            except Exception as e:
+                logger.warning(f"Add Batch Chunk Fehler (Versuch {attempt + 1}): {e}")
+                if attempt < self.config.max_retries - 1:
+                    await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
+        
+        self.stats['retry_count'] += self.config.max_retries
+        return False
+    
+    # Single Add (Legacy-kompatibel)
+    
+    async def add_vector(
+        self,
+        embedding: List[float],
+        metadata: Dict[str, Any],
+        user_id: Optional[str] = None,
+        model_id: Optional[str] = None
+    ) -> bool:
+        """Einzelnen Vektor hinzufügen (Legacy-kompatibel)"""
+        return await self.add_vectors_batch([embedding], [metadata], user_id, model_id)
+    
+    # Batch-Query Operations
+    
+    async def batch_similarity_search(
+        self,
+        query_embeddings: List[List[float]],
+        k: int = 5,
+        user_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> BatchSearchResult:
+        """
+        Batch-Similarity-Search für parallele Abfragen
+        """
+        user_id = user_id or self.config.default_user_id
+        model_id = model_id or self.config.default_model_id
+        
+        start_time = time.time()
+        all_results = []
+        
+        try:
+            # Parallele Queries ausführen
+            tasks = []
+            for embedding in query_embeddings:
+                task = self._single_similarity_search(
+                    embedding, k, user_id, model_id, filters
+                )
+                tasks.append(task)
+            
+            # Alle Queries parallel ausführen
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Ergebnisse verarbeiten
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Query {i} fehlgeschlagen: {result}")
+                    all_results.append([])
+                else:
+                    all_results.append(result)
+            
+            processing_time = time.time() - start_time
+            
+            # Stats aktualisieren
+            self.stats['total_batch_queries'] += 1
+            self.stats['total_queries'] += len(query_embeddings)
+            self._update_avg_time('query', processing_time)
+            
+            # Ergebnis-Statistiken
+            total_results = sum(len(results) for results in all_results)
+            avg_results = total_results / len(query_embeddings) if query_embeddings else 0
+            
+            logger.info(f"Batch-Query abgeschlossen: {len(query_embeddings)} Queries, "
+                       f"{avg_results:.1f} avg results, {processing_time:.2f}s")
+            
+            return BatchSearchResult(
+                results=all_results,
+                processing_time=processing_time,
+                total_queries=len(query_embeddings),
+                avg_results_per_query=avg_results,
+                metadata={
+                    'user_id': user_id,
+                    'model_id': model_id,
+                    'k': k,
+                    'filters': filters
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Batch-Query fehlgeschlagen: {e}")
+            self.stats['connection_errors'] += 1
+            
+            # Fallback: Leere Ergebnisse
+            return BatchSearchResult(
+                results=[[] for _ in query_embeddings],
+                processing_time=time.time() - start_time,
+                total_queries=len(query_embeddings),
+                avg_results_per_query=0,
+                metadata={'error': str(e)}
+            )
+    
+    async def _single_similarity_search(
+        self,
+        query_embedding: List[float],
+        k: int,
+        user_id: str,
+        model_id: str,
+        filters: Optional[Dict[str, Any]]
+    ) -> List[SearchResult]:
+        """Einzelne Similarity Search"""
+        
+        payload = {
+            "user_id": user_id,
+            "model_id": model_id,
+            "query": query_embedding,
             "k": k
         }
         
         if filters:
             payload["filters"] = filters
         
-        if namespace:
-            if "filters" not in payload:
-                payload["filters"] = {}
-            payload["filters"]["namespace"] = namespace
-        
         try:
-            response = await self._make_request(
-                "POST",
-                "/vectors/batch_query",
+            async with self.session.post(
+                f"{self.config.base_url}/vectors/query",
                 json=payload
-            )
-            
-            if response is None:
-                return []
-            
-            # Parse batch results
-            batch_results = []
-            for batch_item in response.get("results", []):
-                query_results = []
-                for item in batch_item:
-                    result = QueryResult(
-                        id=item.get("id", ""),
-                        score=item.get("score", 0.0),
-                        metadata=item.get("metadata", {})
-                    )
-                    query_results.append(result)
-                batch_results.append(query_results)
-            
-            return batch_results
-            
+            ) as response:
+                
+                if response.status == 200:
+                    data = await response.json()
+                    return self._parse_search_results(data)
+                else:
+                    error_text = await response.text()
+                    logger.warning(f"Similarity Search fehlgeschlagen: {response.status} - {error_text}")
+                    return []
+                    
         except Exception as e:
-            print(f"Error in batch query: {e}")
+            logger.debug(f"Similarity Search Fehler: {e}")
             return []
     
-    async def delete_vectors(self, 
-                           user_id: str, 
-                           model_id: str,
-                           ids: List[str],
-                           namespace: Optional[str] = None) -> bool:
-        """
-        Löscht Vektoren aus dem Store
-        """
-        await self.initialize()
+    def _parse_search_results(self, data: List[Dict[str, Any]]) -> List[SearchResult]:
+        """Konvertiert API-Antwort zu SearchResult-Objekten"""
+        results = []
         
-        filters = {"id": {"$in": ids}}
-        if namespace:
-            filters["namespace"] = namespace
-        
-        payload = {
-            "user_id": user_id,
-            "model_id": model_id,
-            "filters": filters
-        }
-        
-        try:
-            response = await self._make_request(
-                "DELETE",
-                "/vectors/delete",
-                json=payload
-            )
-            
-            return response is not None
-            
-        except Exception as e:
-            print(f"Error deleting vectors: {e}")
-            return False
-    
-    async def get_store_stats(self, user_id: str, model_id: str) -> Optional[VectorStoreStats]:
-        """
-        Holt Statistiken für einen Store
-        """
-        await self.initialize()
-        
-        try:
-            response = await self._make_request(
-                "GET",
-                f"/vectors/count?user_id={user_id}&model_id={model_id}"
-            )
-            
-            if response is None:
-                return None
-            
-            return VectorStoreStats(
-                total_vectors=response.get("count", 0),
-                query_latency_ms=response.get("avg_query_time", 0.0) * 1000,
-                add_latency_ms=response.get("avg_add_time", 0.0) * 1000,
-                storage_size_mb=response.get("storage_size_mb", 0.0),
-                last_updated=response.get("last_updated", "")
-            )
-            
-        except Exception as e:
-            print(f"Error getting store stats: {e}")
-            return None
-    
-    async def export_store(self, user_id: str, model_id: str) -> Optional[bytes]:
-        """
-        Exportiert Store als ZIP
-        """
-        await self.initialize()
-        
-        try:
-            async with self.session.get(
-                f"{self.config.base_url}/admin/export_zip",
-                params={"user_id": user_id, "model_id": model_id}
-            ) as response:
-                if response.status == 200:
-                    return await response.read()
-                return None
+        for item in data:
+            try:
+                # Flexibles Parsing für verschiedene API-Formate
+                content = ""
+                score = 0.0
+                metadata = {}
                 
-        except Exception as e:
-            print(f"Error exporting store: {e}")
-            return None
+                if isinstance(item, dict):
+                    # Score extrahieren
+                    score = item.get('score', item.get('similarity', item.get('distance', 0.0)))
+                    
+                    # Content extrahieren
+                    meta = item.get('metadata', {})
+                    content = (
+                        meta.get('text') or 
+                        meta.get('content') or 
+                        item.get('content') or 
+                        item.get('text') or 
+                        str(item)
+                    )
+                    
+                    # Metadata verarbeiten
+                    metadata = meta.copy() if isinstance(meta, dict) else {}
+                    metadata.update({
+                        'user_id': metadata.get('user_id'),
+                        'document_id': metadata.get('document_id') or metadata.get('id'),
+                        'index': metadata.get('index')
+                    })
+                
+                result = SearchResult(
+                    content=content,
+                    score=float(score),
+                    metadata=metadata,
+                    user_id=metadata.get('user_id'),
+                    document_id=metadata.get('document_id')
+                )
+                
+                results.append(result)
+                
+            except Exception as e:
+                logger.debug(f"Result Parsing Fehler: {e}")
+                continue
+        
+        return results
     
-    async def import_store(self, user_id: str, model_id: str, zip_data: bytes) -> bool:
+    # Legacy-kompatible Methoden
+    
+    async def similarity_search(
+        self,
+        query: Union[str, List[float]],
+        k: int = 5,
+        user_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[SearchResult]:
         """
-        Importiert Store aus ZIP
+        Legacy-kompatible Similarity Search
+        Unterstützt sowohl Text-Queries (benötigt Embedding Engine) als auch direkte Embeddings
         """
-        await self.initialize()
+        
+        # Falls Text-Query, muss zu Embedding konvertiert werden
+        if isinstance(query, str):
+            raise ValueError(
+                "Text-Queries benötigen Embedding Engine. "
+                "Verwenden Sie search_by_text() oder konvertieren Sie zu Embedding."
+            )
+        
+        # Embedding-Query
+        batch_result = await self.batch_similarity_search(
+            query_embeddings=[query],
+            k=k,
+            user_id=user_id,
+            model_id=model_id,
+            filters=filters
+        )
+        
+        return batch_result.results[0] if batch_result.results else []
+    
+    async def search_by_text(
+        self,
+        query_text: str,
+        embedding_engine,
+        k: int = 5,
+        user_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[SearchResult]:
+        """
+        Text-basierte Suche mit Embedding Engine
+        """
+        try:
+            # Text zu Embedding konvertieren
+            query_embedding = await embedding_engine.encode_text(query_text)
+            
+            # Similarity Search durchführen
+            return await self.similarity_search(
+                query=query_embedding,
+                k=k,
+                user_id=user_id,
+                model_id=model_id,
+                filters=filters
+            )
+            
+        except Exception as e:
+            logger.error(f"Text-basierte Suche fehlgeschlagen: {e}")
+            return []
+    
+    async def batch_search_by_text(
+        self,
+        query_texts: List[str],
+        embedding_engine,
+        k: int = 5,
+        user_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> BatchSearchResult:
+        """
+        Batch Text-basierte Suche mit Embedding Engine
+        Optimal für RAG-Batch-Processing
+        """
+        try:
+            # Batch-Embedding für alle Query-Texte
+            query_embeddings = await embedding_engine.encode_texts(query_texts)
+            
+            # Batch Similarity Search
+            return await self.batch_similarity_search(
+                query_embeddings=query_embeddings,
+                k=k,
+                user_id=user_id,
+                model_id=model_id,
+                filters=filters
+            )
+            
+        except Exception as e:
+            logger.error(f"Batch Text-Suche fehlgeschlagen: {e}")
+            return BatchSearchResult(
+                results=[[] for _ in query_texts],
+                processing_time=0.0,
+                total_queries=len(query_texts),
+                avg_results_per_query=0,
+                metadata={'error': str(e)}
+            )
+    
+    # Store Management
+    
+    async def get_store_stats(
+        self,
+        user_id: Optional[str] = None,
+        model_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Gibt Store-Statistiken zurück"""
+        user_id = user_id or self.config.default_user_id
+        model_id = model_id or self.config.default_model_id
         
         try:
-            data = aiohttp.FormData()
-            data.add_field('file', zip_data, filename='store.zip')
-            data.add_field('user_id', user_id)
-            data.add_field('model_id', model_id)
+            params = {
+                "user_id": user_id,
+                "model_id": model_id
+            }
             
-            async with self.session.post(
-                f"{self.config.base_url}/admin/import_zip",
-                data=data
+            async with self.session.get(
+                f"{self.config.base_url}/vectors/count",
+                params=params
             ) as response:
+                
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    return {"error": f"Status {response.status}"}
+                    
+        except Exception as e:
+            logger.debug(f"Store Stats Fehler: {e}")
+            return {"error": str(e)}
+    
+    async def delete_store(
+        self,
+        user_id: str,
+        model_id: str,
+        confirm: bool = False
+    ) -> bool:
+        """Löscht kompletten Store (Vorsicht!)"""
+        if not confirm:
+            logger.warning("Store-Löschung benötigt confirm=True")
+            return False
+        
+        try:
+            payload = {
+                "user_id": user_id,
+                "model_id": model_id,
+                "confirm": True
+            }
+            
+            async with self.session.delete(
+                f"{self.config.base_url}/admin/delete_store",
+                json=payload
+            ) as response:
+                
                 return response.status == 200
                 
         except Exception as e:
-            print(f"Error importing store: {e}")
+            logger.error(f"Store-Löschung fehlgeschlagen: {e}")
             return False
     
-    async def _make_request(self, 
-                          method: str, 
-                          endpoint: str, 
-                          json: Optional[Dict] = None,
-                          params: Optional[Dict] = None) -> Optional[Dict]:
-        """
-        Macht HTTP Request mit Retry Logic
-        """
-        url = f"{self.config.base_url}{endpoint}"
-        
-        for attempt in range(self.config.retry_attempts):
-            try:
-                async with self.session.request(
-                    method, 
-                    url, 
-                    json=json,
-                    params=params
-                ) as response:
-                    if response.status == 200:
-                        if response.content_type == 'application/json':
-                            return await response.json()
-                        else:
-                            return {"success": True}
-                    elif response.status == 404:
-                        print(f"Endpoint not found: {endpoint}")
-                        return None
-                    elif response.status == 401:
-                        print(f"Authentication failed for {endpoint}")
-                        return None
-                    else:
-                        print(f"HTTP {response.status} for {endpoint}")
-                        if attempt < self.config.retry_attempts - 1:
-                            await asyncio.sleep(self.config.retry_delay * (attempt + 1))
-                            continue
-                        return None
-                        
-            except asyncio.TimeoutError:
-                print(f"Timeout for {endpoint} (attempt {attempt + 1})")
-                if attempt < self.config.retry_attempts - 1:
-                    await asyncio.sleep(self.config.retry_delay * (attempt + 1))
-                    continue
-                return None
-            except Exception as e:
-                print(f"Request error for {endpoint}: {e}")
-                if attempt < self.config.retry_attempts - 1:
-                    await asyncio.sleep(self.config.retry_delay * (attempt + 1))
-                    continue
-                return None
-        
-        return None
+    # Performance & Monitoring
     
-    async def _health_check(self) -> bool:
-        """
-        Prüft ob mlx-vector-db erreichbar ist
-        """
-        try:
-            response = await self._make_request("GET", "/monitoring/health")
-            if response:
-                print(f"✅ mlx-vector-db connection established")
-                return True
-            else:
-                print(f"❌ mlx-vector-db health check failed")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Cannot connect to mlx-vector-db: {e}")
-            return False
-    
-    def _generate_id(self, index: int, user_id: str, namespace: Optional[str] = None) -> str:
-        """
-        Generiert eindeutige ID für Vektor
-        """
-        timestamp = int(time.time() * 1000)
-        content = f"{user_id}:{namespace}:{index}:{timestamp}"
-        return hashlib.md5(content.encode()).hexdigest()
+    def _update_avg_time(self, operation: str, time_taken: float):
+        """Aktualisiert durchschnittliche Ausführungszeiten"""
+        key = f'avg_{operation}_time'
+        if key in self.stats:
+            self.stats[key] = self.stats[key] * 0.9 + time_taken * 0.1
+        else:
+            self.stats[key] = time_taken
     
     def get_performance_stats(self) -> Dict[str, Any]:
-        """
-        Liefert Performance-Statistiken
-        """
-        avg_query_time = self.total_query_time / self.query_count if self.query_count > 0 else 0
-        avg_add_time = self.total_add_time / self.add_count if self.add_count > 0 else 0
-        
+        """Gibt Performance-Statistiken zurück"""
         return {
-            "total_queries": self.query_count,
-            "total_vectors_added": self.add_count,
-            "average_query_time_ms": avg_query_time * 1000,
-            "average_add_time_ms": avg_add_time * 1000,
-            "queries_per_second": self.query_count / self.total_query_time if self.total_query_time > 0 else 0,
-            "vectors_per_second": self.add_count / self.total_add_time if self.total_add_time > 0 else 0,
-            "active_stores": len(self.stores)
+            **self.stats,
+            'config': {
+                'base_url': self.config.base_url,
+                'max_batch_size': self.config.max_batch_size,
+                'batch_timeout': self.config.batch_timeout,
+                'max_retries': self.config.max_retries
+            },
+            'health': {
+                'session_active': self.session is not None,
+                'error_rate': self.stats['connection_errors'] / max(1, self.stats['total_queries'])
+            }
         }
     
-    async def benchmark(self, user_id: str = "benchmark_user", model_id: str = "test_model") -> Dict[str, float]:
-        """
-        Performance Benchmark für Vector Store
-        """
-        print("Running Vector Store Benchmark...")
-        
-        # Test data
-        test_vectors = np.random.rand(100, 384).astype(np.float32).tolist()
-        test_metadata = [{"doc_id": f"doc_{i}", "content": f"test document {i}"} for i in range(100)]
-        
-        # Create store
-        await self.create_user_store(user_id, model_id)
-        
-        # Benchmark add operations
-        start_time = time.time()
-        success = await self.add_vectors(user_id, model_id, test_vectors, test_metadata)
-        add_time = time.time() - start_time
-        
-        if not success:
-            return {"error": "Failed to add vectors"}
-        
-        # Benchmark query operations
-        query_times = []
-        for i in range(10):
-            query_vector = test_vectors[i]
+    async def optimize_performance(self):
+        """Performance-Optimierung basierend auf aktuellen Stats"""
+        try:
+            # Adaptive Batch-Größe basierend auf Erfolgsrate
+            error_rate = self.stats['connection_errors'] / max(1, self.stats['total_queries'])
             
-            start_time = time.time()
-            results = await self.query(user_id, model_id, query_vector, k=5)
-            query_time = time.time() - start_time
-            query_times.append(query_time)
-        
-        avg_query_time = sum(query_times) / len(query_times)
-        
-        # Benchmark batch query
-        batch_queries = test_vectors[:10]
-        start_time = time.time()
-        batch_results = await self.batch_query(user_id, model_id, batch_queries, k=5)
-        batch_time = time.time() - start_time
-        
-        return {
-            "vectors_added": len(test_vectors),
-            "add_time_seconds": add_time,
-            "vectors_per_second": len(test_vectors) / add_time,
-            "average_query_time_ms": avg_query_time * 1000,
-            "queries_per_second": 1 / avg_query_time,
-            "batch_query_time_seconds": batch_time,
-            "batch_queries_per_second": len(batch_queries) / batch_time
-        }
-
-# Usage Examples
-async def example_usage():
-    """Beispiele für Vector Store Usage"""
+            if error_rate > 0.1:  # Mehr als 10% Fehler
+                self.config.max_batch_size = max(10, self.config.max_batch_size // 2)
+                logger.info(f"Batch-Größe reduziert auf {self.config.max_batch_size} aufgrund hoher Fehlerrate")
+            elif error_rate < 0.01:  # Weniger als 1% Fehler
+                self.config.max_batch_size = min(200, self.config.max_batch_size * 1.2)
+                logger.info(f"Batch-Größe erhöht auf {self.config.max_batch_size}")
+            
+        except Exception as e:
+            logger.debug(f"Performance-Optimierung fehlgeschlagen: {e}")
     
-    # Initialize with config
+    async def cleanup(self):
+        """Cleanup-Methode"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+        
+        logger.info("Vector Store Cleanup abgeschlossen")
+
+
+# Utility Functions
+
+async def create_vector_store(
+    base_url: str = "http://localhost:8000",
+    api_key: str = "your-secure-key"
+) -> MLXVectorStore:
+    """Factory Function für Vector Store"""
     config = VectorStoreConfig(
-        base_url="http://localhost:8000",
-        api_key="your-api-key",
-        batch_size=50
+        base_url=base_url,
+        api_key=api_key
     )
     
     store = MLXVectorStore(config)
-    
-    try:
-        # Create user store
-        success = await store.create_user_store("user_123", "gte-small")
-        print(f"Store created: {success}")
-        
-        # Add vectors
-        vectors = np.random.rand(10, 384).tolist()
-        metadata = [{"text": f"Document {i}", "category": "test"} for i in range(10)]
-        
-        success = await store.add_vectors("user_123", "gte-small", vectors, metadata)
-        print(f"Vectors added: {success}")
-        
-        # Query vectors
-        query_vector = vectors[0]
-        results = await store.query("user_123", "gte-small", query_vector, k=5)
-        print(f"Query results: {len(results)}")
-        
-        for result in results[:3]:
-            print(f"  ID: {result.id}, Score: {result.score:.3f}")
-        
-        # Performance stats
-        stats = store.get_performance_stats()
-        print(f"Performance: {stats}")
-        
-        # Benchmark
-        benchmark_results = await store.benchmark()
-        print(f"Benchmark: {benchmark_results}")
-        
-    finally:
-        await store.close()
+    await store.initialize()
+    return store
 
-if __name__ == "__main__":
-    asyncio.run(example_usage())
+
+async def test_vector_store_connection(
+    base_url: str = "http://localhost:8000",
+    api_key: str = "your-secure-key"
+) -> Dict[str, Any]:
+    """Testet Vector Store Verbindung"""
+    try:
+        async with create_vector_store(base_url, api_key) as store:
+            # Health Check
+            health = await store._health_check()
+            
+            # Store Stats
+            stats = await store.get_store_stats()
+            
+            return {
+                'connection': 'success',
+                'health': health,
+                'stats': stats,
+                'base_url': base_url
+            }
+            
+    except Exception as e:
+        return {
+            'connection': 'failed',
+            'error': str(e),
+            'base_url': base_url
+        }
+
+
+async def benchmark_vector_store_performance(
+    store: MLXVectorStore,
+    test_embeddings: Optional[List[List[float]]] = None,
+    k: int = 5
+) -> Dict[str, Any]:
+    """Benchmark für Vector Store Performance"""
+    
+    if test_embeddings is None:
+        # Generiere Test-Embeddings
+        import random
+        test_embeddings = [
+            [random.random() for _ in range(384)]
+            for _ in range(100)
+        ]
+    
+    test_metadata = [
+        {"text": f"Test document {i}", "id": i}
+        for i in range(len(test_embeddings))
+    ]
+    
+    # Add Benchmark
+    start_time = time.time()
+    add_success = await store.add_vectors_batch(
+        embeddings=test_embeddings,
+        metadata=test_metadata,
+        user_id="benchmark_user"
+    )
+    add_time = time.time() - start_time
+    
+    # Query Benchmark
+    query_embeddings = test_embeddings[:10]  # Erste 10 als Queries
+    
+    start_time = time.time()
+    batch_result = await store.batch_similarity_search(
+        query_embeddings=query_embeddings,
+        k=k,
+        user_id="benchmark_user"
+    )
+    query_time = time.time() - start_time
+    
+    return {
+        'add_performance': {
+            'success': add_success,
+            'embeddings_count': len(test_embeddings),
+            'time_seconds': add_time,
+            'embeddings_per_second': len(test_embeddings) / add_time if add_time > 0 else 0
+        },
+        'query_performance': {
+            'queries_count': len(query_embeddings),
+            'time_seconds': query_time,
+            'queries_per_second': len(query_embeddings) / query_time if query_time > 0 else 0,
+            'avg_results_per_query': batch_result.avg_results_per_query,
+            'total_results': sum(len(results) for results in batch_result.results)
+        },
+        'store_stats': store.get_performance_stats()
+    }
