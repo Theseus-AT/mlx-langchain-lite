@@ -3,8 +3,7 @@
 
 # Core MLX Dependencies
 mlx>=0.25.2
-mlx-lm>=0.24.0
-mlx-vector-db
+mlx-lm>=0.20.0
 
 # Python Core Libraries
 numpy>=1.24.0
@@ -34,9 +33,7 @@ rich>=13.0.0
 # Configuration Management
 pydantic>=2.0.0
 python-dotenv>=1.0.0
-
-# MLX-LangChain-Lite Specific Dependencies
-# (Diese sollten mit Ihrem bestehenden Projekt übereinstimmen)
+pyyaml>=6.0.1
 
 # Document Processing
 pymupdf>=1.23.0  # fitz für PDF-Verarbeitung
@@ -61,9 +58,6 @@ scipy>=1.11.0
 # Utilities
 tqdm>=4.66.0
 click>=8.1.0
-pathlib2>=2.3.7; python_version < "3.6"
-
-# JSON Processing
 orjson>=3.9.0  # Schnellere JSON-Verarbeitung
 
 # Memory Profiling (Development)
@@ -136,10 +130,14 @@ cryptography>=41.0.0
 # Environment Management
 python-decouple>=3.8
 
-# Zu deiner bestehenden requirements.txt hinzufügen:
-pyyaml>=6.0.1          # Für Configuration System
-httpx>=0.25.0          # Modernerer HTTP Client
-aiofiles>=23.2.0       # Async File I/O
-diskcache>=5.6.0       # Persistent Caching
-typer>=0.9.0           # CLI Tools
-watchdog>=3.0.0        # File Watching für Development
+# MLX Vector Database (Theseus-AT Implementation)
+git+https://github.com/Theseus-AT/mlx-vector-db.git
+
+# REMOVED: mlx-vector-db (custom implementation, not on PyPI)
+# Install separately: pip install -e /path/to/your/mlx-vector-db
+
+# Additional useful packages
+aiofiles>=23.2.0
+httpx>=0.25.0
+diskcache>=5.6.0
+typer>=0.9.0
